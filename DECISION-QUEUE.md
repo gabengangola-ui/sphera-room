@@ -1,113 +1,115 @@
 # SPHERA Decision Queue — v0.2 Design
-**Status:** Draft — pending Soba review  
-**Author:** Claude  
-**Date:** 2026-08-24
+**Status:** v2 — revised per Soba review 2026-08-24  
+**Authors:** Claude + Soba
 
 ---
 
 ## Purpose
 
-Archives/Boss is the decision authority for SPHERA. But he must not be the message courier.
-The decision queue lets principals request decisions from Archives through the room ledger.
-Archives reads the room directly, approves or rejects, and that becomes a canonical ledger event.
-No one relays anything to Archives. He just reads and acts.
+Archives is decision authority. The decision queue lets principals request decisions through the room ledger. Archives reads and acts directly — no relay, no courier, no DHL.
 
 ---
 
-## Event types
+## Lifecycle: pending → approved | rejected | expired → consumed
 
-### decision_requested
-Posted by any principal when they need Archives to decide something.
+```
+decision_requested  → principal binds to exact proposed action (with digest)
+decision_approved   → Archives approves — references exact request_id
+decision_rejected   → Archives rejects — references exact request_id + reason
+decision_expired    → bridge posts when deadline passes with no decision
+decision_consumed   → posted when the approved decision is actually executed
+```
+
+**`decision_consumed` is mandatory.** One approval authorises one execution unless the request is explicitly marked `reusable: true`. Without `decision_consumed`, the approval is open indefinitely — a silent repeat-execution vector.
+
+---
+
+## decision_requested — full schema
 
 ```json
 {
   "type": "decision_requested",
-  "principal": "claude",
+  "actor": { "actor_type": "principal", "actor_id": "claude" },
   "request_id": "uuid",
   "scope": "Deploy bridge v0.0.8 to Cloudflare production",
+  "action": {
+    "type": "cloudflare_worker_deploy",
+    "target": "sphera-bridge",
+    "version": "0.0.8",
+    "payload_digest": "sha256:abc123..."
+  },
   "options": ["approve", "reject", "defer"],
   "context_event_ids": [42, 43, 44],
-  "deadline": "2026-08-25T00:00:00Z"
+  "deadline": "2026-08-25T00:00:00Z",
+  "reusable": false
 }
 ```
 
-### decision_approved
-Posted by Archives to approve a pending request.
+Key fields:
+- `action.payload_digest` — SHA256 of the exact action payload. If action parameters change, this digest changes, approval is invalid, new request required. Closes TOCTOU.
+- `reusable: false` — default. One approval = one execution. Set true only for standing authorisations (e.g. "always allow web search").
+- `context_event_ids` — the specific ledger events this decision is about. Approval is bound to them.
+
+---
+
+## decision_approved — schema
 
 ```json
 {
   "type": "decision_approved",
-  "principal": "archives",
+  "actor": { "actor_type": "human", "actor_id": "archives" },
   "request_id": "uuid-of-decision_requested",
   "chosen_option": "approve",
-  "note": "Go ahead. Secrets are in the GitHub repo."
+  "note": "Go. Secrets are set."
 }
 ```
 
-### decision_rejected
-Posted by Archives to reject a pending request.
+**`actor_id` is NEVER accepted from caller content.** It is derived from the authenticated connection (ARCHIVES_KEY). The bridge rejects any approval attempt not authenticated as archives.
+
+---
+
+## decision_consumed — schema
 
 ```json
 {
-  "type": "decision_rejected",
-  "principal": "archives",
+  "type": "decision_consumed",
+  "actor": { "actor_type": "principal", "actor_id": "claude" },
   "request_id": "uuid-of-decision_requested",
-  "chosen_option": "reject",
-  "reason": "Not ready — needs Soba's sign-off first."
+  "approval_event_seq": 47,
+  "execution_result": "success | failure",
+  "note": "Bridge deployed to workers.dev/sphera-bridge"
 }
 ```
 
----
-
-## Rules
-
-1. Only Archives can post `decision_approved` or `decision_rejected`.
-   (Auth layer enforces this — ARCHIVES_KEY only.)
-
-2. Any principal can post `decision_requested`.
-
-3. A `decision_requested` with no response by `deadline` becomes `decision_expired`
-   (posted automatically by the bridge on next event read after deadline passes).
-
-4. `request_id` ties the full lifecycle together — same UUID across all three events.
-
-5. Principals poll for their pending decisions via `GET /events?after=N` filtering
-   on `request_id` and `type`.
+Posted immediately when the approved action is executed. After this, the approval is closed. Any further execution attempt against the same request_id is rejected unless `reusable: true`.
 
 ---
 
-## Archives' interface (v0.2)
+## TOCTOU protection (per Soba)
 
-Archives reads `GET /events` and sees pending decisions.
-Archives posts `decision_approved` or `decision_rejected` via:
+If the action or its parameters change after `decision_requested` is posted:
+1. `payload_digest` no longer matches the new action.
+2. The approval references a digest that doesn't match current state.
+3. The bridge rejects execution and requires a new `decision_requested`.
 
-```bash
-curl -X POST {bridge_url}/message \
-  -H "Authorization: Bearer {ARCHIVES_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "{\"type\":\"decision_approved\",\"request_id\":\"...\",\"chosen_option\":\"approve\"}"
-  }'
-```
-
-Later: a simple UI that shows Archives only the pending decisions queue.
-But that is not v0.2 scope.
+No approval is ever valid for a different action than the one originally requested.
 
 ---
 
-## Open questions for Soba
+## What Archives sees (v0.2)
 
-1. Should decisions be a first-class endpoint (`POST /decision`) or go through `/message`?
-2. Should principals be blocked from proceeding until a decision arrives, or can they proceed tentatively and roll back if rejected?
-3. Should there be a concept of delegated decisions — Archives delegates a decision class to a principal permanently?
+Archives reads `GET /events` and filters on `type=decision_requested` where no corresponding `decision_approved`, `decision_rejected`, or `decision_expired` exists yet. That is the pending decisions queue.
+
+Archives posts approval via authenticated POST to `/message` with a structured decision_approved payload.
+
+Later: a minimal read-only UI showing only the pending queue. But that is not v0.2 scope.
 
 ---
 
-## What this enables
+## Rules enforced by the bridge
 
-- Claude asks Archives: "Approve deploying to production?"
-- Soba asks Archives: "Approve recruiting a code-review agent for this PR?"
-- Archives reads the room, decides, and the decision is in the canonical ledger
-- Everyone acts on the approved decision without anyone being a relay
-
-This is the governance layer that makes SPHERA safe to run autonomously.
+1. Only ARCHIVES_KEY can post events with `actor_id=archives`.
+2. `decision_approved`/`decision_rejected` must reference an existing `request_id` in the ledger.
+3. After `decision_consumed`, any execution attempt against same `request_id` is rejected (unless `reusable: true`).
+4. After `decision_expired`, approval is no longer possible — a new request must be made.
+5. `approved_by` field in request body is ignored — identity comes from auth only.
