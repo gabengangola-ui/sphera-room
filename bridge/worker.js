@@ -1,30 +1,31 @@
 /**
- * SPHERA Bridge v0.0.2
+ * SPHERA Bridge v0.0.3
  *
- * Fixed from v0.0.1 (issues raised by Soba):
- *   - Concurrent-safe event log: each event is its own KV key
- *     (eliminates read-modify-write race under concurrent writes)
- *   - Proper path sanitization: percent-decode before checking,
- *     split/filter/rejoin to prevent traversal bypass via ....// etc.
- *   - Payload size limits: 10 KB messages, 100 KB artifacts
- *   - GitHub artifact race: retry with jitter on 409 SHA conflict
+ * Changes from v0.0.2 (per Soba's review):
  *
- * Three operations only:
- *   POST /message       - post a message to the room
- *   POST /artifact      - publish a file artifact to GitHub
- *   GET  /events        - read the event log
+ * 1. MONOTONIC SEQUENCING via Durable Object
+ *    - A single DO instance ('global') is the sole issuer of sequence numbers
+ *    - Transactional storage guarantees strictly monotonic, gap-free integers
+ *    - Events are stored as event:{seq_10digit}:{uuid} — lex sort == insertion order
+ *    - GET /events?after=N returns only events with seq > N (cursor-based pagination)
  *
- * Identity is derived from the Bearer token. Callers never declare who they are.
+ * 2. STRICT PATH VALIDATION
+ *    - Paths outside allowed roots are REJECTED, not silently redirected
+ *    - Callers must be explicit: artifacts/, sessions/, or bridge/
+ *
+ * 3. EXPLICIT RETRY FAILURE
+ *    - After GITHUB_MAX_RETRIES exhausted, fails loudly with a clear message
+ *    - Non-409 errors fail immediately without retry
  */
 
-const MAX_MESSAGE_BYTES  = 10_000;   // 10 KB
-const MAX_ARTIFACT_BYTES = 100_000;  // 100 KB
+const MAX_MESSAGE_BYTES  = 10_000;
+const MAX_ARTIFACT_BYTES = 100_000;
 const MAX_PATH_LENGTH    = 200;
 const GITHUB_MAX_RETRIES = 3;
 const REPO               = 'gabengangola-ui/sphera-room';
+const ALLOWED_PREFIXES   = ['artifacts/', 'sessions/', 'bridge/'];
 
-// Allowed path prefixes — artifacts must live under one of these
-const ALLOWED_PREFIXES = ['artifacts/', 'sessions/', 'bridge/'];
+// ── Main Worker ───────────────────────────────────────────────────────────────
 
 export default {
   async fetch(request, env) {
@@ -36,8 +37,6 @@ export default {
   }
 };
 
-// ── Routing ───────────────────────────────────────────────────────────────────
-
 async function route(request, env) {
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -46,17 +45,17 @@ async function route(request, env) {
   const principal = authenticate(request, env);
   if (!principal) return json({ error: 'Unauthorized' }, 401);
 
-  const { pathname } = new URL(request.url);
+  const url = new URL(request.url);
 
-  if (request.method === 'POST' && pathname === '/message')  return handlePostMessage(request, principal, env);
-  if (request.method === 'POST' && pathname === '/artifact') return handlePublishArtifact(request, principal, env);
-  if (request.method === 'GET'  && pathname === '/events')   return handleReadEvents(env);
+  if (request.method === 'POST' && url.pathname === '/message')  return handlePostMessage(request, principal, env);
+  if (request.method === 'POST' && url.pathname === '/artifact') return handlePublishArtifact(request, principal, env);
+  if (request.method === 'GET'  && url.pathname === '/events')   return handleReadEvents(url, env);
 
   return json({ error: 'Not found' }, 404);
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-// Identity is always derived from the credential, never from the request body.
+// Identity is always derived from the credential. Callers never declare who they are.
 
 function authenticate(request, env) {
   const header = request.headers.get('Authorization') || '';
@@ -75,92 +74,143 @@ async function handlePostMessage(request, principal, env) {
   if (raw === null) return json({ error: `Message exceeds ${MAX_MESSAGE_BYTES} byte limit` }, 413);
 
   let body;
-  try { body = JSON.parse(raw); }
-  catch { return json({ error: 'Invalid JSON body' }, 400); }
+  try { body = JSON.parse(raw); } catch { return json({ error: 'Invalid JSON body' }, 400); }
 
   const { content } = body;
   if (!content || typeof content !== 'string' || !content.trim()) {
     return json({ error: '"content" must be a non-empty string' }, 400);
   }
 
-  const event = buildEvent(principal, 'message', { content: content.trim() });
+  const seq   = await nextSequence(env);
+  const event = buildEvent(seq, principal, 'message', { content: content.trim() });
   await writeEvent(event, env);
-  return json({ ok: true, event_id: event.id }, 201);
+
+  return json({ ok: true, event_id: event.id, seq: event.seq }, 201);
 }
 
 async function handlePublishArtifact(request, principal, env) {
-  const raw = await readBodyWithLimit(request, MAX_ARTIFACT_BYTES + 2_000); // +2 KB JSON overhead
-  if (raw === null) return json({ error: `Artifact exceeds size limit` }, 413);
+  const raw = await readBodyWithLimit(request, MAX_ARTIFACT_BYTES + 2_000);
+  if (raw === null) return json({ error: 'Artifact exceeds size limit' }, 413);
 
   let body;
-  try { body = JSON.parse(raw); }
-  catch { return json({ error: 'Invalid JSON body' }, 400); }
+  try { body = JSON.parse(raw); } catch { return json({ error: 'Invalid JSON body' }, 400); }
 
   const { path, content, commit_message } = body;
 
   if (!path    || typeof path    !== 'string') return json({ error: '"path" is required'    }, 400);
   if (!content || typeof content !== 'string') return json({ error: '"content" is required' }, 400);
-  if (content.length > MAX_ARTIFACT_BYTES)     return json({ error: `Content exceeds ${MAX_ARTIFACT_BYTES} byte limit` }, 413);
+  if (content.length > MAX_ARTIFACT_BYTES)     return json({ error: 'Content exceeds size limit' }, 413);
 
   const safePath = sanitizePath(path);
-  if (!safePath) return json({ error: 'Invalid or disallowed path' }, 400);
+  if (!safePath) {
+    return json({
+      error: `Path rejected. Must begin with one of: ${ALLOWED_PREFIXES.join(', ')}`,
+      hint:  'Example: "artifacts/my-file.md"'
+    }, 400);
+  }
 
   const message = commit_message?.trim() || `${principal}: publish ${safePath}`;
   const result  = await commitWithRetry(safePath, content, message, env);
   if (!result.ok) return json({ error: 'GitHub commit failed', detail: result.detail }, 502);
 
-  const event = buildEvent(principal, 'artifact', { path: safePath, commit_message: message, sha: result.sha });
+  const seq   = await nextSequence(env);
+  const event = buildEvent(seq, principal, 'artifact', { path: safePath, commit_message: message, sha: result.sha });
   await writeEvent(event, env);
-  return json({ ok: true, event_id: event.id, sha: result.sha }, 201);
+
+  return json({ ok: true, event_id: event.id, seq: event.seq, sha: result.sha }, 201);
 }
 
-async function handleReadEvents(env) {
-  const events = await readAllEvents(env);
-  return json({ events, count: events.length });
+async function handleReadEvents(url, env) {
+  const afterParam = url.searchParams.get('after');
+  const after      = afterParam !== null ? parseInt(afterParam, 10) : 0;
+
+  if (afterParam !== null && (isNaN(after) || after < 0)) {
+    return json({ error: '"after" must be a non-negative integer' }, 400);
+  }
+
+  const events = await readEventsSince(after, env);
+  const cursor  = events.length > 0 ? events.at(-1).seq : after;
+
+  return json({ events, count: events.length, cursor });
 }
 
-// ── Event log — concurrent-safe ───────────────────────────────────────────────
-// Each event is its own KV entry: event:{ISO-timestamp}:{uuid}
-// No read-modify-write → no lost updates when two principals write simultaneously.
-// Reading lists all keys with the event: prefix, fetches in parallel, sorts by timestamp.
+// ── Event Sequencer — Durable Object ─────────────────────────────────────────
+// One global DO instance is the single writer for sequence numbers.
+// storage.transaction() makes increment atomic — no two events share a seq.
+// This gives the room a canonical total order with no ambiguity.
 
-function buildEvent(principal, type, data) {
-  const id = crypto.randomUUID();
-  return { id, timestamp: new Date().toISOString(), principal, type, ...data };
+export class EventSequencer {
+  constructor(state) { this.state = state; }
+
+  async fetch() {
+    const seq = await this.state.storage.transaction(async (txn) => {
+      const current = (await txn.get('seq')) ?? 0;
+      const next    = current + 1;
+      await txn.put('seq', next);
+      return next;
+    });
+    return new Response(JSON.stringify({ seq }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function nextSequence(env) {
+  const id      = env.SEQUENCER.idFromName('global');
+  const stub    = env.SEQUENCER.get(id);
+  const resp    = await stub.fetch('http://internal/next');
+  const { seq } = await resp.json();
+  return seq;
+}
+
+// ── Event Log — KV, ordered by sequence ──────────────────────────────────────
+// Key: event:{seq_zero_padded_10}:{uuid}
+// Zero-padding ensures lexicographic order == sequence order.
+// GET /events?after=N fetches only keys beyond that cursor.
+
+function buildEvent(seq, principal, type, data) {
+  return {
+    id:        crypto.randomUUID(),
+    seq,                              // monotonic cursor; never reused
+    timestamp: new Date().toISOString(),
+    principal,                        // set by auth layer only
+    type,
+    ...data
+  };
 }
 
 async function writeEvent(event, env) {
-  const key = `event:${event.timestamp}:${event.id}`;
+  const key = `event:${String(event.seq).padStart(10, '0')}:${event.id}`;
   await env.EVENTS.put(key, JSON.stringify(event));
 }
 
-async function readAllEvents(env) {
-  const list = await env.EVENTS.list({ prefix: 'event:' });
+async function readEventsSince(after, env) {
+  const cursorKey = `event:${String(after).padStart(10, '0')}`;
+  const list      = await env.EVENTS.list({ prefix: 'event:', startAfter: cursorKey });
+
   if (!list.keys.length) return [];
+
   const values = await Promise.all(list.keys.map(k => env.EVENTS.get(k.name)));
   return values
     .filter(Boolean)
     .map(v => JSON.parse(v))
-    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    .filter(e => e.seq > after)
+    .sort((a, b) => a.seq - b.seq);
 }
 
-// ── Path sanitization ─────────────────────────────────────────────────────────
-// 1. Reject if too long.
-// 2. Percent-decode BEFORE any checks (prevents ....// and %2e%2e bypasses).
-// 3. Split on /, filter empty segments, dots, and double-dots.
-// 4. Reject control characters.
-// 5. Enforce an allowed-prefix allowlist — unknown prefixes get artifacts/ prepended.
+// ── Path Sanitization — strict allowed-root ───────────────────────────────────
+// Paths outside allowed roots are REJECTED — no silent redirect.
+// Percent-decoded before all checks to block bypass via %2e%2e, ....// etc.
 
 function sanitizePath(raw) {
   if (!raw || typeof raw !== 'string') return null;
-  if (raw.length > MAX_PATH_LENGTH) return null;
+  if (raw.length > MAX_PATH_LENGTH)    return null;
 
   let decoded;
-  try { decoded = decodeURIComponent(raw); }
-  catch { return null; }
+  try { decoded = decodeURIComponent(raw); } catch { return null; }
 
   const segments = decoded.split('/').map(s => s.trim());
-  const safe = segments.filter(s => s.length > 0 && s !== '.' && s !== '..');
+  const safe     = segments.filter(s => s.length > 0 && s !== '.' && s !== '..');
   if (safe.length === 0) return null;
 
   // Reject control characters and null bytes
@@ -168,27 +218,32 @@ function sanitizePath(raw) {
 
   const joined = safe.join('/');
 
-  // Must start with an allowed prefix; if not, prefix with artifacts/
-  if (!ALLOWED_PREFIXES.some(p => joined.startsWith(p))) {
-    return `artifacts/${joined}`;
-  }
+  // Strict: reject if not under a known root
+  if (!ALLOWED_PREFIXES.some(p => joined.startsWith(p))) return null;
 
   return joined;
 }
 
-// ── GitHub — retry on 409 SHA conflict ───────────────────────────────────────
-// Concurrent artifact writes can both read the same SHA and then one fails.
-// We retry up to GITHUB_MAX_RETRIES times with random jitter between attempts.
+// ── GitHub — bounded retry, explicit failure ──────────────────────────────────
 
 async function commitWithRetry(path, content, message, env) {
   for (let attempt = 1; attempt <= GITHUB_MAX_RETRIES; attempt++) {
     if (attempt > 1) await sleep(Math.random() * 400 + 200 * attempt);
+
     const result = await commitToGitHub(path, content, message, env);
     if (result.ok)             return result;
-    if (result.status !== 409) return result; // non-retryable error
-    // 409 = SHA conflict → loop to re-fetch SHA
+    if (result.status !== 409) return result; // non-retryable error; fail immediately
+    // 409 = SHA conflict; re-fetch SHA on next iteration
   }
-  return { ok: false, detail: 'Max retries exceeded on GitHub conflict' };
+
+  // Loud failure after exhausting retries — caller should surface this clearly
+  return {
+    ok:     false,
+    status: 409,
+    detail: `GitHub write failed after ${GITHUB_MAX_RETRIES} attempts due to concurrent SHA conflict. ` +
+            `Another principal may be writing to "${path}" simultaneously. ` +
+            `Retry shortly or use a unique path.`
+  };
 }
 
 async function commitToGitHub(path, content, message, env) {
@@ -196,10 +251,9 @@ async function commitToGitHub(path, content, message, env) {
   const headers = {
     'Authorization': `token ${env.GITHUB_TOKEN}`,
     'Content-Type':  'application/json',
-    'User-Agent':    'sphera-bridge/0.0.2'
+    'User-Agent':    'sphera-bridge/0.0.3'
   };
 
-  // Fetch current SHA (required for updates; absent = new file)
   let sha;
   const existing = await fetch(url, { headers });
   if (existing.ok) {
@@ -226,9 +280,9 @@ async function commitToGitHub(path, content, message, env) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function readBodyWithLimit(request, limit) {
-  const reader  = request.body?.getReader();
+  const reader = request.body?.getReader();
   if (!reader) return '';
-  const chunks  = [];
+  const chunks = [];
   let total = 0;
   while (true) {
     const { done, value } = await reader.read();
@@ -237,9 +291,10 @@ async function readBodyWithLimit(request, limit) {
     if (total > limit) { reader.cancel(); return null; }
     chunks.push(value);
   }
-  return new TextDecoder().decode(
-    chunks.reduce((acc, c) => { const n = new Uint8Array(acc.length + c.length); n.set(acc); n.set(c, acc.length); return n; }, new Uint8Array(0))
-  );
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { merged.set(c, offset); offset += c.length; }
+  return new TextDecoder().decode(merged);
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
