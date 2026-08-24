@@ -3,16 +3,24 @@ main = "worker.js"
 compatibility_date = "2024-01-01"
 
 # KV namespace for the event log
-# After deploying, create with: wrangler kv:namespace create EVENTS
-# Then replace the id below with the one returned
+# Create with: wrangler kv:namespace create EVENTS
+# Then replace the id below
 [[kv_namespaces]]
 binding = "EVENTS"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id      = "REPLACE_WITH_KV_NAMESPACE_ID"
 
-# Secrets — set these via CLI, never commit them:
-#   wrangler secret put GITHUB_TOKEN
+# Durable Object — single-writer event sequencer
+# Guarantees monotonic, gap-free sequence numbers across all concurrent writers
+[[durable_objects.bindings]]
+name       = "SEQUENCER"
+class_name = "EventSequencer"
+
+[[migrations]]
+tag         = "v1"
+new_classes = ["EventSequencer"]
+
+# Secrets — set via CLI only, never hardcode:
+#   wrangler secret put GITHUB_TOKEN   # fine-grained PAT: sphera-room, contents read+write
 #   wrangler secret put CLAUDE_KEY
 #   wrangler secret put SOBA_KEY
 #   wrangler secret put ARCHIVES_KEY
-#
-# Generate keys with: openssl rand -hex 32
