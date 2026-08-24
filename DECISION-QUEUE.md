@@ -1,115 +1,112 @@
-# SPHERA Decision Queue — v0.2 Design
-**Status:** v2 — revised per Soba review 2026-08-24  
-**Authors:** Claude + Soba
+# SPHERA Decision Queue — v3
+**Status:** Implementation-ready — reviewed by Soba 2026-08-24  
+**Author:** Claude  **Reviewed:** Soba
 
 ---
 
-## Purpose
-
-Archives is decision authority. The decision queue lets principals request decisions through the room ledger. Archives reads and acts directly — no relay, no courier, no DHL.
-
----
-
-## Lifecycle: pending → approved | rejected | expired → consumed
+## Lifecycle (corrected from v2)
 
 ```
-decision_requested  → principal binds to exact proposed action (with digest)
-decision_approved   → Archives approves — references exact request_id
-decision_rejected   → Archives rejects — references exact request_id + reason
-decision_expired    → bridge posts when deadline passes with no decision
-decision_consumed   → posted when the approved decision is actually executed
+pending → approved → claimed → consumed
+         ↘ rejected (terminal)
+pending → expired (terminal)
+claimed → execution_failed (retryable — claim is cleared, back to approved)
 ```
 
-**`decision_consumed` is mandatory.** One approval authorises one execution unless the request is explicitly marked `reusable: true`. Without `decision_consumed`, the approval is open indefinitely — a silent repeat-execution vector.
+- `rejected` and `expired` are **terminal**. No transitions out.
+- `reusable:true` is **removed**. Standing authorisations belong in grants/policy.
+- Only `approved` may transition to `claimed`. Bridge enforces this atomically.
+- A failed execution after claim records `execution_failed` and resets status to `approved` — explicit retry policy, not silent.
 
 ---
 
-## decision_requested — full schema
+## Endpoints (typed — not through /message)
 
-```json
-{
-  "type": "decision_requested",
-  "actor": { "actor_type": "principal", "actor_id": "claude" },
-  "request_id": "uuid",
-  "scope": "Deploy bridge v0.0.8 to Cloudflare production",
-  "action": {
-    "type": "cloudflare_worker_deploy",
-    "target": "sphera-bridge",
-    "version": "0.0.8",
-    "payload_digest": "sha256:abc123..."
-  },
-  "options": ["approve", "reject", "defer"],
-  "context_event_ids": [42, 43, 44],
-  "deadline": "2026-08-25T00:00:00Z",
-  "reusable": false
-}
+| Method | Path | Auth | Action |
+|--------|------|------|--------|
+| POST | /decision | any principal | Request a decision |
+| POST | /decision/:id/approve | arcides only | Approve |
+| POST | /decision/:id/reject | arcides only | Reject |
+| POST | /decision/:id/claim | requesting principal only | Atomic pre-side-effect claim |
+| POST | /decision/:id/consume | requesting principal only | Mark consumed post-execution |
+| POST | /decision/:id/fail | requesting principal only | Mark execution failed, reset to approved |
+| GET | /decision/:id | any principal | Read current state |
+
+---
+
+## Canonical payload hashing
+
+`payload_digest` is SHA-256 of canonical JSON of the `action` object.
+
+**Canonical JSON rules:**
+1. Object keys sorted alphabetically at all depths
+2. No extra whitespace
+3. UTF-8 encoding
+4. Numbers: standard JSON (no trailing zeros, no scientific notation for integers)
+5. Strings: standard JSON escaping
+
+**Bound fields** (all must be included in the action object before hashing):
+- `scope` — what is being decided
+- `target` — resource or system being affected
+- `principal` — who is requesting
+- `params` — all action parameters
+
+A parameter change = different digest = approval invalid = new request required. TOCTOU closed.
+
+---
+
+## Atomic claim (bridge enforcement)
+
+The entire claim check-and-set runs inside `storage.transaction()`:
+
+```
+1. Read decision_status:{request_id}
+2. Assert status === 'approved'
+3. Assert payload_digest matches the bound digest from decision_approved
+4. Assert caller === decision_requested.principal (only requester can claim)
+5. Set decision_status to 'claimed'
+6. Append claim event to ledger
 ```
 
-Key fields:
-- `action.payload_digest` — SHA256 of the exact action payload. If action parameters change, this digest changes, approval is invalid, new request required. Closes TOCTOU.
-- `reusable: false` — default. One approval = one execution. Set true only for standing authorisations (e.g. "always allow web search").
-- `context_event_ids` — the specific ledger events this decision is about. Approval is bound to them.
+If any assertion fails → reject with reason. No partial state.
+Only after successful transaction does the caller execute the side effect.
 
 ---
 
-## decision_approved — schema
+## Adversarial test cases (required before merge)
 
-```json
-{
-  "type": "decision_approved",
-  "actor": { "actor_type": "human", "actor_id": "archives" },
-  "request_id": "uuid-of-decision_requested",
-  "chosen_option": "approve",
-  "note": "Go. Secrets are set."
-}
+1. **Concurrent claim** — two claim requests for same decision, only one must succeed
+2. **Digest mismatch** — approve with one payload_digest, claim with mutated params
+3. **Replay after consume** — second claim attempt on a consumed decision
+4. **Expired approval** — claim attempt after decision deadline
+5. **Non-arcides approval** — claude or soba posting to /decision/:id/approve → 403
+6. **Malformed event** — missing required fields → 400, not 500
+7. **Retry after claimed failure** — execution_failed resets to approved, second claim succeeds
+
+---
+
+## Identity
+
+Canonical identity for Archives is **`arcides`** (not `archives`).
+Identity is always derived from the connection credential. Caller content never sets it.
+`ARCHIVES_KEY` → resolves to `'arcides'` in authenticate().
+
+---
+
+## DO storage keys for decisions
+
+```
+decision:{request_id}          → decision_requested event
+decision_approval:{request_id} → decision_approved event
+decision_status:{request_id}   → current state string
+decision_claim:{request_id}    → decision_claimed event (if claimed)
 ```
 
-**`actor_id` is NEVER accepted from caller content.** It is derived from the authenticated connection (ARCHIVES_KEY). The bridge rejects any approval attempt not authenticated as archives.
-
 ---
 
-## decision_consumed — schema
+## What this does NOT include (deferred)
 
-```json
-{
-  "type": "decision_consumed",
-  "actor": { "actor_type": "principal", "actor_id": "claude" },
-  "request_id": "uuid-of-decision_requested",
-  "approval_event_seq": 47,
-  "execution_result": "success | failure",
-  "note": "Bridge deployed to workers.dev/sphera-bridge"
-}
-```
-
-Posted immediately when the approved action is executed. After this, the approval is closed. Any further execution attempt against the same request_id is rejected unless `reusable: true`.
-
----
-
-## TOCTOU protection (per Soba)
-
-If the action or its parameters change after `decision_requested` is posted:
-1. `payload_digest` no longer matches the new action.
-2. The approval references a digest that doesn't match current state.
-3. The bridge rejects execution and requires a new `decision_requested`.
-
-No approval is ever valid for a different action than the one originally requested.
-
----
-
-## What Archives sees (v0.2)
-
-Archives reads `GET /events` and filters on `type=decision_requested` where no corresponding `decision_approved`, `decision_rejected`, or `decision_expired` exists yet. That is the pending decisions queue.
-
-Archives posts approval via authenticated POST to `/message` with a structured decision_approved payload.
-
-Later: a minimal read-only UI showing only the pending queue. But that is not v0.2 scope.
-
----
-
-## Rules enforced by the bridge
-
-1. Only ARCHIVES_KEY can post events with `actor_id=archives`.
-2. `decision_approved`/`decision_rejected` must reference an existing `request_id` in the ledger.
-3. After `decision_consumed`, any execution attempt against same `request_id` is rejected (unless `reusable: true`).
-4. After `decision_expired`, approval is no longer possible — a new request must be made.
-5. `approved_by` field in request body is ignored — identity comes from auth only.
+- Standing grants / policy-based authorisations (separate grants layer)
+- Delegation tokens / scoped agent leases (after decision impl is solid)
+- UI for decision queue (backlog)
+- TSL Sentinel signature verification (v1.0)
