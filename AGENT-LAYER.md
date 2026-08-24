@@ -1,103 +1,107 @@
-# SPHERA Agent Layer — v0.2 Design Draft
-**Status:** Draft — pending Soba review  
-**Author:** Claude  
-**Date:** 2026-08-24
+# SPHERA Agent Layer — v0.2 Design
+**Status:** v2 — revised per Soba review 2026-08-24  
+**Authors:** Claude + Soba
 
 ---
 
-## What this adds
+## Actor envelope (revised)
 
-Principals (Claude, Soba, Archives) can recruit named agents for bounded tasks.
-Agents commit results to the room ledger under the recruiting principal's identity.
-No agent acts outside the scope its principal defined.
+Every event carries a first-class `actor` block. Authentication terminates at the Principal/worker connection. The ledger records the derived actor identity for provenance.
 
----
-
-## Agent identity in the ledger
-
-Each agent event carries:
 ```json
 {
-  "principal": "claude",
-  "agent": {
-    "id": "uuid",
-    "name": "search-agent",
-    "skill": "web_search",
-    "recruited_by": "claude",
-    "task_id": "uuid-of-task-event"
-  },
-  "type": "agent_result",
-  ...
+  "actor": {
+    "actor_type": "principal | agent | human",
+    "actor_id": "claude | soba | archives | agent-uuid",
+    "sponsor_principal_id": "claude",
+    "delegation_id": "uuid-of-task_created-event"
+  }
 }
 ```
 
-The `principal` field is always the recruiting principal — the agent acts on their behalf.
-The `agent` block is metadata only: auditable, never used for auth.
+Rules:
+- `actor_type=principal` — actor_id matches an authenticated key. No sponsor needed.
+- `actor_type=agent` — actor_id is a uuid. sponsor_principal_id and delegation_id are required.
+- `actor_type=human` — for Archives acting directly outside a principal session.
+- Agents are NOT principals. They hold no credentials. Auth terminates at the sponsoring principal.
+- `sponsor_principal_id` and `delegation_id` give full auditable lineage back to the human decision that authorised the agent.
 
 ---
 
 ## Task lifecycle
 
 ```
-task_created   → principal defines scope, skill, input, timeout
-task_accepted  → agent acknowledges (optional for simple agents)
-task_result    → agent posts output (references task_id)
-task_expired   → if timeout reached with no result
+task_created      → principal defines scope, skill, input, authority_expiry
+task_accepted     → agent acknowledges (optional)
+task_result       → agent posts output (references delegation_id)
+task_result_late  → result posted after authority_expiry (flagged, pending review)
+task_expired      → bridge posts when authority_expiry passes with no result
 ```
 
-All four event types reference the same `task_id` for correlation.
+### Authority vs result — SEPARATED (per Soba)
+
+| Concept | Meaning | Expiry type |
+|---------|---------|-------------|
+| `authority_expiry` | Agent loses capability to act | HARD — bridge enforces, no exceptions |
+| `result_acceptance_deadline` | Window to accept a late result | SOFT — humans decide |
+
+An agent may submit `task_result_late` for human review, but it MUST NOT retain execution capability after `authority_expiry`. These are independent clocks.
 
 ---
 
-## Recruitment rules (v0.2)
+## Skill registry (revised)
 
-- Any principal can recruit any agent within defined skill bounds
-- Archives can restrict skills available to each principal via a config event
-- Default: all skills open to all principals
-- Agents cannot recruit other agents (no agent chains in v0.2)
+Registry mutations are immutable events — not mutable state.
+The DO maintains a materialized current projection from the event history.
 
----
+```
+skill_registered   → new skill added to registry
+skill_deprecated   → skill marked inactive (not deleted — history is immutable)
+skill_updated      → parameters/description updated (creates new version, old preserved)
+```
 
-## Approval gate
+`GET /skills` returns the current materialized projection.
+The event log is the source of truth. The registry is a read-optimised view of it.
 
-Two modes — decided per deployment via env var `AGENT_APPROVAL`:
-
-| Mode | Behaviour |
-|------|-----------|
-| `open` | Principals recruit freely, no approval needed |
-| `supervised` | Each recruitment appends a `task_pending_approval` event; Archives approves via `task_approved` before agent runs |
-
-v0.2 default: `open`. Shift to `supervised` when real money or medical decisions are involved.
+This means: you can audit exactly what skills existed at any point in time by replaying events up to that timestamp.
 
 ---
 
-## Skill registry (v0.2 starter set)
+## Agent chains — v0.2 rule
 
-| Skill ID | Description |
-|----------|-------------|
-| `web_search` | Search and return results |
-| `code_exec` | Execute bounded code, return output |
-| `summarise` | Summarise a document or thread |
-| `draft` | Draft a document given a spec |
-| `review` | Review an artifact against criteria |
+**One delegation level only. No exceptions.**
+- Principals may spawn agents.
+- Agents may NOT spawn other agents.
+- This is enforced by the bridge: if `actor_type=agent` posts a `task_created`, it is rejected with 403.
 
-Skills are registered in the DO — principals cannot invent skills not in the registry.
+Agent chains are v0.3 scope with explicit human approval gate per chain.
 
 ---
 
-## Open questions for Soba
+## Recruitment rules
 
-1. Agent identity: sub-principal field vs separate `agent` block (see above)?
-2. Timeout: hard kill or soft expiry (agent can still post result after expiry with a flag)?
-3. Agent chains: keep banned in v0.2, or allow one level of nesting?
-4. Skill registry: stored in DO or a separate config file in the repo?
+- Any principal can recruit any registered skill within their authority bounds.
+- Archives can restrict available skills per principal via a `principal_skill_grant` event.
+- Default (no grants configured): all registered skills open to all principals.
+- Skill bounds are checked at task_created time against the current registry projection.
 
 ---
 
-## What this does NOT include (v0.2 scope boundary)
+## Open questions resolved (Soba review)
 
-- No agent-to-agent direct communication
-- No agent memory between tasks
-- No agent spawning other agents
-- No UI for agent management
-- TSL Sentinel integration is v1.0
+| Question | Resolution |
+|----------|------------|
+| Agent as metadata vs first-class? | First-class `actor` envelope, not just nested metadata |
+| Soft vs hard timeout? | Hard expiry for authority, soft for result acceptance |
+| Agent chains? | Banned v0.2, one level only |
+| Registry in DO or config? | Events in ledger, materialized projection in DO |
+
+---
+
+## What is NOT in v0.2
+
+- Agent-to-agent communication
+- Agent memory between tasks
+- Recursive agent spawning
+- TSL Sentinel integration (v1.0)
+- Agent management UI
