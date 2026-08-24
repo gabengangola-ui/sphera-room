@@ -1,27 +1,28 @@
 /**
  * SPHERA Bridge v0.0.6
  *
- * Changes from v0.0.5 — artifact lifecycle only:
+ * Changes from v0.0.5 — artifact lifecycle completed:
  *
- * 1. artifact_intent stores recoverable content
- *    The intent event now includes the actual artifact bytes (capped at 100 KB).
- *    A reconciliation process can retry the GitHub sync from the ledger alone,
- *    without asking any principal to resend content.
+ * 1. CONTENT STORED IN INTENT
+ *    artifact_intent now includes the artifact content (bounded by 100 KB cap).
+ *    The ledger is self-contained: a reconciliation process can retry the
+ *    GitHub sync from the ledger alone without asking the caller to resend.
  *
- * 2. Completion events close the lifecycle
- *    After GitHub write, the bridge appends a second ledger event:
- *      artifact_committed  { intent_id, intent_seq, path, sha }
- *      artifact_failed     { intent_id, intent_seq, path, error }
- *    Both reference the originating intent. Inspecting the ledger now tells
- *    you unambiguously whether a GitHub sync succeeded or not.
+ * 2. COMPLETION EVENTS
+ *    After GitHub write: appends artifact_committed (with SHA) or
+ *    artifact_failed (with error). Both reference intent_id and intent_seq.
+ *    The ledger now distinguishes success from failure — provenance is complete.
  *
- * 3. Idempotency key prevents duplicate intents on retry
- *    Callers may supply idempotency_key. If omitted, the bridge derives one
- *    from SHA-256(principal + path + content). A second POST /artifact with
- *    the same key finds the existing intent and proceeds to the GitHub step
- *    without creating a new intent event.
+ * 3. IDEMPOTENCY KEY
+ *    Caller may supply idempotency_key (string). Bridge auto-generates one if
+ *    absent. On retry with the same key:
+ *    - If intent exists and completion exists → return completion idempotently.
+ *    - If intent exists but no completion → retry GitHub, write completion.
+ *    No duplicate intent events are ever created for the same key.
  *
- * Nothing else changed from v0.0.5.
+ * Artifact flow:
+ *   artifact_intent (content stored) → GitHub write → artifact_committed | artifact_failed
+ *   Both completion types reference: intent_id, intent_seq.
  */
 
 const MAX_MESSAGE_BYTES    = 10_000;
@@ -87,105 +88,105 @@ async function handlePostMessage(request, principal, env) {
     return json({ error: '"content" must be a non-empty string' }, 400);
   }
 
-  const event = await ledgerAppend({ principal, type: 'message', content: content.trim() }, env);
+  const event = await doAppend({ principal, type: 'message', content: content.trim() }, env);
   return json({ ok: true, event_id: event.id, seq: event.seq }, 201);
 }
 
 async function handlePublishArtifact(request, principal, env) {
-  const raw = await readBodyWithLimit(request, MAX_ARTIFACT_BYTES + 2_000);
-  if (raw === null) return json({ error: 'Artifact exceeds size limit' }, 413);
+  const raw = await readBodyWithLimit(request, MAX_ARTIFACT_BYTES + 4_000);
+  if (raw === null) return json({ error: 'Artifact payload exceeds size limit' }, 413);
 
   let body;
   try { body = JSON.parse(raw); } catch { return json({ error: 'Invalid JSON body' }, 400); }
 
-  const { path, content, commit_message, idempotency_key } = body;
+  const { path, content, commit_message, idempotency_key: rawKey } = body;
 
   if (!path    || typeof path    !== 'string') return json({ error: '"path" is required'    }, 400);
   if (!content || typeof content !== 'string') return json({ error: '"content" is required' }, 400);
 
   if (utf8ByteLength(content) > MAX_ARTIFACT_BYTES) {
-    return json({ error: `Content exceeds ${MAX_ARTIFACT_BYTES} byte limit (UTF-8 bytes)` }, 413);
+    return json({ error: `Content exceeds ${MAX_ARTIFACT_BYTES} byte limit (UTF-8)` }, 413);
   }
-
   if (commit_message !== undefined && commit_message !== null) {
     if (typeof commit_message !== 'string') return json({ error: '"commit_message" must be a string' }, 400);
     if (commit_message.length > MAX_COMMIT_MSG_CHARS) {
-      return json({ error: `"commit_message" must not exceed ${MAX_COMMIT_MSG_CHARS} characters` }, 400);
+      return json({ error: `"commit_message" exceeds ${MAX_COMMIT_MSG_CHARS} character limit` }, 400);
     }
-  }
-
-  if (idempotency_key !== undefined && idempotency_key !== null &&
-      (typeof idempotency_key !== 'string' || idempotency_key.length > 128)) {
-    return json({ error: '"idempotency_key" must be a string under 128 characters' }, 400);
   }
 
   const safePath = sanitizePath(path);
   if (!safePath) {
     return json({
-      error: `Path rejected. Must begin with one of: ${ALLOWED_PREFIXES.join(', ')}`,
-      hint:  'Paths with "." or ".." segments are also rejected.'
+      error: `Path rejected. Must begin with: ${ALLOWED_PREFIXES.join(', ')}`,
+      hint:  '"." and ".." segments are rejected outright.'
     }, 400);
   }
 
-  const message  = (typeof commit_message === 'string' ? commit_message.trim() : '') ||
-                   `${principal}: publish ${safePath}`;
-  const idemKey  = (typeof idempotency_key === 'string' && idempotency_key.trim())
-                   ? idempotency_key.trim()
-                   : await deriveIdempotencyKey(principal, safePath, content);
+  // Caller-supplied idempotency key, or auto-generated for this request.
+  // Retry with the same key to avoid creating duplicate intent events.
+  const ikey    = (typeof rawKey === 'string' && rawKey.trim()) ? rawKey.trim() : crypto.randomUUID();
+  const message = (typeof commit_message === 'string' ? commit_message.trim() : '') ||
+                  `${principal}: publish ${safePath}`;
 
-  // Step 1 — Idempotent intent.
-  // If this key already has an intent, returns the existing one.
-  // Retry calls never create duplicate intent events.
-  const { intent, is_new } = await ledgerIntentStart({
+  // ── Step 1: Get or create intent (idempotent) ────────────────────────────
+  const { intent, completion } = await doArtifactBegin({
     principal,
-    path:           safePath,
-    commit_message: message,
-    content,          // stored so reconciliation can retry without re-upload
-    idempotency_key: idemKey,
+    path:            safePath,
+    commit_message:  message,
+    content,          // stored in the ledger — the bridge can recover without re-asking the caller
+    idempotency_key: ikey,
   }, env);
 
-  // Step 2 — GitHub sync (best-effort).
+  // ── Already completed on a prior call — return idempotently ──────────────
+  if (completion) {
+    const ok = completion.type === 'artifact_committed';
+    return json({
+      ok,
+      idempotent: true,
+      event_id:   completion.id,
+      seq:        completion.seq,
+      intent_seq: intent.seq,
+      ...(ok ? { sha: completion.sha } : { error: completion.error })
+    }, ok ? 200 : 502);
+  }
+
+  // ── Step 2: Sync to GitHub ───────────────────────────────────────────────
   const result = await commitWithRetry(safePath, content, message, env);
 
-  // Step 3 — Completion event closes the lifecycle.
-  // artifact_committed or artifact_failed always references the intent.
+  // ── Step 3: Record outcome (committed or failed) — both reference intent ─
   if (result.ok) {
-    const committed = await ledgerIntentComplete({
+    const committed = await doArtifactEnd({
+      type:       'artifact_committed',
       principal,
-      outcome:    'artifact_committed',
       intent_id:  intent.id,
       intent_seq: intent.seq,
       path:       safePath,
       sha:        result.sha,
     }, env);
-
     return json({
-      ok:            true,
-      is_new_intent: is_new,
-      intent_id:     intent.id,
-      intent_seq:    intent.seq,
-      committed_seq: committed.seq,
-      sha:           result.sha,
+      ok:         true,
+      event_id:   committed.id,
+      seq:        committed.seq,
+      intent_seq: intent.seq,
+      sha:        result.sha,
     }, 201);
-
   } else {
-    const failed = await ledgerIntentComplete({
+    const failed = await doArtifactEnd({
+      type:       'artifact_failed',
       principal,
-      outcome:    'artifact_failed',
       intent_id:  intent.id,
       intent_seq: intent.seq,
       path:       safePath,
       error:      result.detail,
     }, env);
-
     return json({
-      ok:            false,
-      error:         'GitHub sync failed. Intent is recorded; retry will not create a duplicate.',
-      intent_id:     intent.id,
-      intent_seq:    intent.seq,
-      failed_seq:    failed.seq,
-      idempotency_key: idemKey,
-      detail:        result.detail,
+      ok:              false,
+      error:           'GitHub sync failed. Intent is in the ledger — retry with the same idempotency_key.',
+      detail:          result.detail,
+      idempotency_key: ikey,
+      event_id:        failed.id,
+      seq:             failed.seq,
+      intent_seq:      intent.seq,
     }, 502);
   }
 }
@@ -193,18 +194,21 @@ async function handlePublishArtifact(request, principal, env) {
 async function handleReadEvents(url, env) {
   const afterParam = url.searchParams.get('after');
   const after      = afterParam !== null ? parseInt(afterParam, 10) : 0;
-
-  if (isNaN(after) || after < 0) {
-    return json({ error: '"after" must be a non-negative integer' }, 400);
-  }
+  if (isNaN(after) || after < 0) return json({ error: '"after" must be a non-negative integer' }, 400);
 
   const { events } = await doReadSince(after, env);
   const cursor      = events.length > 0 ? events.at(-1).seq : after;
-
   return json({ events, count: events.length, cursor });
 }
 
 // ── Durable Object — EventLedger ─────────────────────────────────────────────
+//
+// Internal storage layout:
+//   __seq__                   → current sequence counter (integer)
+//   event:{seq_10d}           → serialised event (all types)
+//   intent:{intent_id}        → serialised artifact_intent event (for lookup)
+//   ikey:{idempotency_key}    → intent_id  (dedup index)
+//   completion:{intent_id}    → serialised completion event (committed | failed)
 
 export class EventLedger {
   constructor(state) { this.state = state; }
@@ -212,10 +216,10 @@ export class EventLedger {
   async fetch(request) {
     const url = new URL(request.url);
     try {
-      if (request.method === 'POST' && url.pathname === '/append')           return this.handleAppend(request);
-      if (request.method === 'POST' && url.pathname === '/artifact-start')   return this.handleArtifactStart(request);
-      if (request.method === 'POST' && url.pathname === '/artifact-complete') return this.handleArtifactComplete(request);
-      if (request.method === 'GET'  && url.pathname === '/events')            return this.handleRead(url);
+      if (request.method === 'POST' && url.pathname === '/append')          return this.handleAppend(request);
+      if (request.method === 'POST' && url.pathname === '/artifact-begin')  return this.handleArtifactBegin(request);
+      if (request.method === 'POST' && url.pathname === '/artifact-end')    return this.handleArtifactEnd(request);
+      if (request.method === 'GET'  && url.pathname === '/events')          return this.handleRead(url);
       return new Response('Not found', { status: 404 });
     } catch (err) {
       return new Response(JSON.stringify({ error: err.message }), {
@@ -224,62 +228,79 @@ export class EventLedger {
     }
   }
 
-  // Generic append — used for message events
+  // Generic append — used for messages
   async handleAppend(request) {
     const partial = await request.json();
-    const event   = await this._appendOne(partial);
-    return new Response(JSON.stringify(event), {
-      status: 201, headers: { 'Content-Type': 'application/json' }
+    const event   = await this.state.storage.transaction(async (txn) => {
+      const seq      = ((await txn.get('__seq__')) ?? 0) + 1;
+      const complete = { id: crypto.randomUUID(), seq, timestamp: new Date().toISOString(), ...partial };
+      await txn.put('__seq__', seq);
+      await txn.put(`event:${String(seq).padStart(10, '0')}`, JSON.stringify(complete));
+      return complete;
     });
+    return doResponse(event, 201);
   }
 
-  // Idempotent artifact intent.
-  // If idempotency_key already maps to an existing intent, return it (is_new: false).
-  // Otherwise create and persist the intent with full content (is_new: true).
-  async handleArtifactStart(request) {
-    const { principal, path, commit_message, content, idempotency_key } = await request.json();
+  // Idempotent intent creation
+  async handleArtifactBegin(request) {
+    const { idempotency_key, ...partial } = await request.json();
 
-    const result = await this.state.storage.transaction(async (txn) => {
-      const existingId = await txn.get(`idem:${idempotency_key}`);
+    // Check for existing intent via idempotency key
+    const existingId = await this.state.storage.get(`ikey:${idempotency_key}`);
+    if (existingId) {
+      const intent     = JSON.parse(await this.state.storage.get(`intent:${existingId}`));
+      const compRaw    = await this.state.storage.get(`completion:${existingId}`);
+      const completion = compRaw ? JSON.parse(compRaw) : null;
+      return doResponse({ intent, completion, is_retry: true }, 200);
+    }
 
-      if (existingId) {
-        const existing = JSON.parse(await txn.get(`intent:${existingId}`));
-        return { intent: existing, is_new: false };
-      }
-
+    // New intent — atomically assign seq, persist event, index by ikey
+    const intent = await this.state.storage.transaction(async (txn) => {
       const seq      = ((await txn.get('__seq__')) ?? 0) + 1;
-      const intent   = {
+      const complete = {
         id:              crypto.randomUUID(),
         seq,
         timestamp:       new Date().toISOString(),
-        principal,
         type:            'artifact_intent',
-        path,
-        commit_message,
-        content,          // recoverable — reconciliation can retry from this
         idempotency_key,
+        ...partial,      // principal, path, commit_message, content
       };
-
+      const ekey = `event:${String(seq).padStart(10, '0')}`;
       await txn.put('__seq__', seq);
-      await txn.put(`event:${String(seq).padStart(10, '0')}`, JSON.stringify(intent));
-      await txn.put(`intent:${intent.id}`, JSON.stringify(intent));
-      await txn.put(`idem:${idempotency_key}`, intent.id);
-
-      return { intent, is_new: true };
+      await txn.put(ekey,                      JSON.stringify(complete));
+      await txn.put(`intent:${complete.id}`,   JSON.stringify(complete));
+      await txn.put(`ikey:${idempotency_key}`, complete.id);
+      return complete;
     });
 
-    return new Response(JSON.stringify(result), {
-      status: 201, headers: { 'Content-Type': 'application/json' }
-    });
+    return doResponse({ intent, completion: null, is_retry: false }, 201);
   }
 
-  // Append artifact_committed or artifact_failed, both referencing the intent.
-  async handleArtifactComplete(request) {
-    const partial = await request.json();
-    const event   = await this._appendOne(partial);
-    return new Response(JSON.stringify(event), {
-      status: 201, headers: { 'Content-Type': 'application/json' }
+  // Append completion event — idempotent (safe to call twice)
+  async handleArtifactEnd(request) {
+    const { intent_id, ...partial } = await request.json();
+
+    // Already completed? Return existing completion without creating a duplicate
+    const existing = await this.state.storage.get(`completion:${intent_id}`);
+    if (existing) return doResponse(JSON.parse(existing), 200);
+
+    const completion = await this.state.storage.transaction(async (txn) => {
+      const seq      = ((await txn.get('__seq__')) ?? 0) + 1;
+      const complete = {
+        id:        crypto.randomUUID(),
+        seq,
+        timestamp: new Date().toISOString(),
+        intent_id,
+        ...partial, // type (artifact_committed|artifact_failed), principal, intent_seq, path, sha|error
+      };
+      const ekey = `event:${String(seq).padStart(10, '0')}`;
+      await txn.put('__seq__', seq);
+      await txn.put(ekey,                        JSON.stringify(complete));
+      await txn.put(`completion:${intent_id}`,   JSON.stringify(complete));
+      return complete;
     });
+
+    return doResponse(completion, 201);
   }
 
   async handleRead(url) {
@@ -287,76 +308,53 @@ export class EventLedger {
     const startKey = `event:${String(after + 1).padStart(10, '0')}`;
     const entries  = await this.state.storage.list({ prefix: 'event:', start: startKey });
     const events   = [...entries.values()].map(v => JSON.parse(v));
-    return new Response(JSON.stringify({ events, count: events.length }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return doResponse({ events, count: events.length }, 200);
   }
+}
 
-  async _appendOne(partial) {
-    return this.state.storage.transaction(async (txn) => {
-      const seq      = ((await txn.get('__seq__')) ?? 0) + 1;
-      const complete = {
-        id:        crypto.randomUUID(),
-        seq,
-        timestamp: new Date().toISOString(),
-        ...partial,
-      };
-      await txn.put('__seq__', seq);
-      await txn.put(`event:${String(seq).padStart(10, '0')}`, JSON.stringify(complete));
-      return complete;
-    });
-  }
+function doResponse(data, status) {
+  return new Response(JSON.stringify(data), {
+    status, headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // ── DO client helpers ─────────────────────────────────────────────────────────
 
-function getLedgerStub(env) {
+function getLedger(env) {
   return env.LEDGER.get(env.LEDGER.idFromName('global'));
 }
 
-async function ledgerAppend(partial, env) {
-  const resp = await getLedgerStub(env).fetch('http://internal/append', {
+async function doAppend(partial, env) {
+  const r = await getLedger(env).fetch('http://internal/append', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(partial)
   });
-  if (!resp.ok) throw new Error(`Ledger append failed: ${await resp.text()}`);
-  return resp.json();
+  if (!r.ok) throw new Error(`Ledger append failed: ${await r.text()}`);
+  return r.json();
 }
 
-async function ledgerIntentStart(data, env) {
-  const resp = await getLedgerStub(env).fetch('http://internal/artifact-start', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+async function doArtifactBegin(partial, env) {
+  const r = await getLedger(env).fetch('http://internal/artifact-begin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(partial)
   });
-  if (!resp.ok) throw new Error(`Ledger intent-start failed: ${await resp.text()}`);
-  return resp.json();
+  if (!r.ok) throw new Error(`Ledger artifact-begin failed: ${await r.text()}`);
+  return r.json();
 }
 
-async function ledgerIntentComplete(data, env) {
-  const resp = await getLedgerStub(env).fetch('http://internal/artifact-complete', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+async function doArtifactEnd(partial, env) {
+  const r = await getLedger(env).fetch('http://internal/artifact-end', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(partial)
   });
-  if (!resp.ok) throw new Error(`Ledger intent-complete failed: ${await resp.text()}`);
-  return resp.json();
+  if (!r.ok) throw new Error(`Ledger artifact-end failed: ${await r.text()}`);
+  return r.json();
 }
 
 async function doReadSince(after, env) {
-  const resp = await getLedgerStub(env).fetch(`http://internal/events?after=${after}`);
-  if (!resp.ok) throw new Error(`Ledger read failed: ${await resp.text()}`);
-  return resp.json();
+  const r = await getLedger(env).fetch(`http://internal/events?after=${after}`);
+  if (!r.ok) throw new Error(`Ledger read failed: ${await r.text()}`);
+  return r.json();
 }
 
-// ── Idempotency key derivation ────────────────────────────────────────────────
-// Default: SHA-256(principal|path|content), base64url, first 22 chars.
-// Caller-supplied keys are preferred when provided.
-
-async function deriveIdempotencyKey(principal, path, content) {
-  const data   = new TextEncoder().encode(`${principal}|${path}|${content}`);
-  const hash   = await crypto.subtle.digest('SHA-256', data);
-  const bytes  = new Uint8Array(hash);
-  const b64    = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-  return b64.slice(0, 22);
-}
-
-// ── Path sanitization ─────────────────────────────────────────────────────────
+// ── Path sanitization — strict ────────────────────────────────────────────────
 
 function sanitizePath(raw) {
   if (!raw || typeof raw !== 'string') return null;
@@ -366,14 +364,13 @@ function sanitizePath(raw) {
   try { decoded = decodeURIComponent(raw); } catch { return null; }
 
   const segments = decoded.split('/');
-  if (segments.some(s => /[\x00-\x1f\x7f]/.test(s))) return null;
-  if (segments.some(s => s === '.' || s === '..'))     return null;
 
-  const clean = segments.filter((s, i) => {
-    if (i === 0 && s === '')                        return false;
-    if (i === segments.length - 1 && s === '')      return false;
-    return true;
-  });
+  if (segments.some(s => /[\x00-\x1f\x7f]/.test(s))) return null;
+  if (segments.some(s => s === '.' || s === '..'))     return null; // reject, not filter
+
+  const clean = segments.filter((s, i) =>
+    !(i === 0 && s === '') && !(i === segments.length - 1 && s === '')
+  );
 
   if (clean.length === 0 || clean.some(s => s === '')) return null;
 
@@ -383,7 +380,7 @@ function sanitizePath(raw) {
   return joined;
 }
 
-// ── GitHub — bounded retry ────────────────────────────────────────────────────
+// ── GitHub — bounded retry, explicit failure ──────────────────────────────────
 
 async function commitWithRetry(path, content, message, env) {
   for (let attempt = 1; attempt <= GITHUB_MAX_RETRIES; attempt++) {
@@ -427,7 +424,9 @@ async function commitToGitHub(path, content, message, env) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function utf8ByteLength(str) { return new TextEncoder().encode(str).length; }
+function utf8ByteLength(str) {
+  return new TextEncoder().encode(str).length;
+}
 
 async function readBodyWithLimit(request, limit) {
   const reader = request.body?.getReader();
