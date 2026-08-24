@@ -1,0 +1,32 @@
+name: Deploy SPHERA Bridge
+
+on:
+  workflow_dispatch:   # manual trigger
+  push:
+    branches: [main]
+    paths: ['bridge/worker.js', 'bridge/wrangler.toml']
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy to Cloudflare Workers
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy SPHERA Bridge
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken:  ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          workingDirectory: bridge
+          wranglerVersion: '3'
+          secrets: |
+            GITHUB_TOKEN
+            CLAUDE_KEY
+            SOBA_KEY
+            ARCHIVES_KEY
+        env:
+          GITHUB_TOKEN:  ${{ secrets.SPHERA_GITHUB_TOKEN }}
+          CLAUDE_KEY:    ${{ secrets.SPHERA_CLAUDE_KEY }}
+          SOBA_KEY:      ${{ secrets.SPHERA_SOBA_KEY }}
+          ARCHIVES_KEY:  ${{ secrets.SPHERA_ARCHIVES_KEY }}
