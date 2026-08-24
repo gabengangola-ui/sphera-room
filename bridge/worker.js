@@ -1,28 +1,36 @@
 /**
- * SPHERA Bridge v0.0.6
+ * SPHERA Bridge v0.0.7
  *
- * Changes from v0.0.5 — artifact lifecycle completed:
+ * Addresses Soba's five pre-acceptance checks on v0.0.6:
  *
- * 1. CONTENT STORED IN INTENT
- *    artifact_intent now includes the artifact content (bounded by 100 KB cap).
- *    The ledger is self-contained: a reconciliation process can retry the
- *    GitHub sync from the ledger alone without asking the caller to resend.
+ * A. IDEMPOTENCY SCOPE
+ *    ikey is now scoped as ikey:{principal}:{caller_key}.
+ *    Same key from different principals is a different slot.
+ *    Collision across principals is now impossible.
  *
- * 2. COMPLETION EVENTS
- *    After GitHub write: appends artifact_committed (with SHA) or
- *    artifact_failed (with error). Both reference intent_id and intent_seq.
- *    The ledger now distinguishes success from failure — provenance is complete.
+ * B. COMPLETION UNIQUENESS — INSIDE THE TRANSACTION
+ *    The completion existence check is now inside storage.transaction().
+ *    Two concurrent artifact-end calls cannot both write a completion.
+ *    One wins; the other reads the winner's value. Atomically.
  *
- * 3. IDEMPOTENCY KEY
- *    Caller may supply idempotency_key (string). Bridge auto-generates one if
- *    absent. On retry with the same key:
- *    - If intent exists and completion exists → return completion idempotently.
- *    - If intent exists but no completion → retry GitHub, write completion.
- *    No duplicate intent events are ever created for the same key.
+ * C. EXPLICIT RETRY SEMANTICS
+ *    Rule: one intent, one terminal completion, no exceptions.
+ *    - artifact_committed  → idempotent success (no retry needed).
+ *    - artifact_failed     → 409 with explicit message: use a new
+ *                            idempotency_key to submit a fresh intent.
+ *    - no completion yet   → retry GitHub, append completion.
+ *    Failed intents are permanent ledger history. Retry = new intent.
  *
- * Artifact flow:
- *   artifact_intent (content stored) → GitHub write → artifact_committed | artifact_failed
- *   Both completion types reference: intent_id, intent_seq.
+ * D. CONTENT SIZE — DO-LEVEL DEFENSE IN DEPTH
+ *    The main worker enforces MAX_ARTIFACT_BYTES before calling the DO.
+ *    The DO now also enforces the same cap before writing to storage.
+ *    Giant artifacts cannot bypass the worker and land directly in DO.
+ *
+ * E. READ-SIDE RECONSTRUCTION
+ *    New endpoint: GET /artifact/:intent_id
+ *    Returns { intent, completion } for any intent ID directly,
+ *    without scanning the full event log. Clients can deterministically
+ *    inspect the lifecycle state of any artifact in one call.
  */
 
 const MAX_MESSAGE_BYTES    = 10_000;
@@ -58,6 +66,12 @@ async function route(request, env) {
   if (request.method === 'POST' && url.pathname === '/message')  return handlePostMessage(request, principal, env);
   if (request.method === 'POST' && url.pathname === '/artifact') return handlePublishArtifact(request, principal, env);
   if (request.method === 'GET'  && url.pathname === '/events')   return handleReadEvents(url, env);
+
+  // GET /artifact/:intent_id — direct lifecycle query (point E)
+  const artifactMatch = url.pathname.match(/^\/artifact\/([a-f0-9-]{36})$/);
+  if (request.method === 'GET' && artifactMatch) {
+    return handleGetArtifact(artifactMatch[1], env);
+  }
 
   return json({ error: 'Not found' }, 404);
 }
@@ -122,38 +136,53 @@ async function handlePublishArtifact(request, principal, env) {
     }, 400);
   }
 
-  // Caller-supplied idempotency key, or auto-generated for this request.
-  // Retry with the same key to avoid creating duplicate intent events.
-  const ikey    = (typeof rawKey === 'string' && rawKey.trim()) ? rawKey.trim() : crypto.randomUUID();
-  const message = (typeof commit_message === 'string' ? commit_message.trim() : '') ||
-                  `${principal}: publish ${safePath}`;
+  // A. Idempotency key scoped by principal — collision across principals is impossible
+  const callerKey = (typeof rawKey === 'string' && rawKey.trim()) ? rawKey.trim() : crypto.randomUUID();
+  const ikey      = `${principal}:${callerKey}`;
+  const message   = (typeof commit_message === 'string' ? commit_message.trim() : '') ||
+                    `${principal}: publish ${safePath}`;
 
-  // ── Step 1: Get or create intent (idempotent) ────────────────────────────
+  // Step 1 — get or create intent (idempotent within scoped key)
   const { intent, completion } = await doArtifactBegin({
     principal,
     path:            safePath,
     commit_message:  message,
-    content,          // stored in the ledger — the bridge can recover without re-asking the caller
+    content,
     idempotency_key: ikey,
   }, env);
 
-  // ── Already completed on a prior call — return idempotently ──────────────
+  // C. Explicit retry semantics — one terminal completion per intent, no exceptions
   if (completion) {
-    const ok = completion.type === 'artifact_committed';
-    return json({
-      ok,
-      idempotent: true,
-      event_id:   completion.id,
-      seq:        completion.seq,
-      intent_seq: intent.seq,
-      ...(ok ? { sha: completion.sha } : { error: completion.error })
-    }, ok ? 200 : 502);
+    if (completion.type === 'artifact_committed') {
+      // Already succeeded — return idempotently, no action needed
+      return json({
+        ok:         true,
+        idempotent: true,
+        event_id:   completion.id,
+        seq:        completion.seq,
+        intent_seq: intent.seq,
+        sha:        completion.sha,
+      }, 200);
+    }
+
+    if (completion.type === 'artifact_failed') {
+      // Rule: failed intents are permanent. This intent is closed.
+      // To retry, caller must use a new idempotency_key → creates a fresh intent.
+      return json({
+        ok:              false,
+        error:           'This intent ended in artifact_failed and cannot be retried.',
+        resolution:      'Submit a new request with a different idempotency_key to create a fresh intent.',
+        failed_event_id: completion.id,
+        failed_seq:      completion.seq,
+        intent_seq:      intent.seq,
+      }, 409);
+    }
   }
 
-  // ── Step 2: Sync to GitHub ───────────────────────────────────────────────
+  // Step 2 — sync to GitHub (no completion exists yet)
   const result = await commitWithRetry(safePath, content, message, env);
 
-  // ── Step 3: Record outcome (committed or failed) — both reference intent ─
+  // Step 3 — append exactly one terminal completion event
   if (result.ok) {
     const committed = await doArtifactEnd({
       type:       'artifact_committed',
@@ -181,9 +210,9 @@ async function handlePublishArtifact(request, principal, env) {
     }, env);
     return json({
       ok:              false,
-      error:           'GitHub sync failed. Intent is in the ledger — retry with the same idempotency_key.',
+      error:           'GitHub sync failed. Intent is recorded in the ledger.',
       detail:          result.detail,
-      idempotency_key: ikey,
+      resolution:      'Use a new idempotency_key to submit a fresh intent and retry.',
       event_id:        failed.id,
       seq:             failed.seq,
       intent_seq:      intent.seq,
@@ -201,14 +230,21 @@ async function handleReadEvents(url, env) {
   return json({ events, count: events.length, cursor });
 }
 
+// E. Direct lifecycle query — no event scanning needed
+async function handleGetArtifact(intentId, env) {
+  const result = await doGetArtifact(intentId, env);
+  if (!result.intent) return json({ error: 'Intent not found', intent_id: intentId }, 404);
+  return json(result);
+}
+
 // ── Durable Object — EventLedger ─────────────────────────────────────────────
 //
-// Internal storage layout:
-//   __seq__                   → current sequence counter (integer)
-//   event:{seq_10d}           → serialised event (all types)
-//   intent:{intent_id}        → serialised artifact_intent event (for lookup)
-//   ikey:{idempotency_key}    → intent_id  (dedup index)
-//   completion:{intent_id}    → serialised completion event (committed | failed)
+// Storage layout:
+//   __seq__                        → current sequence counter (integer)
+//   event:{seq_10d}                → any event (all types, ordered)
+//   intent:{intent_id}             → artifact_intent event (lookup index)
+//   ikey:{principal}:{caller_key}  → intent_id (scoped dedup index — point A)
+//   completion:{intent_id}         → terminal completion event (at most one)
 
 export class EventLedger {
   constructor(state) { this.state = state; }
@@ -216,10 +252,11 @@ export class EventLedger {
   async fetch(request) {
     const url = new URL(request.url);
     try {
-      if (request.method === 'POST' && url.pathname === '/append')          return this.handleAppend(request);
-      if (request.method === 'POST' && url.pathname === '/artifact-begin')  return this.handleArtifactBegin(request);
-      if (request.method === 'POST' && url.pathname === '/artifact-end')    return this.handleArtifactEnd(request);
-      if (request.method === 'GET'  && url.pathname === '/events')          return this.handleRead(url);
+      if (request.method === 'POST' && url.pathname === '/append')         return this.handleAppend(request);
+      if (request.method === 'POST' && url.pathname === '/artifact-begin') return this.handleArtifactBegin(request);
+      if (request.method === 'POST' && url.pathname === '/artifact-end')   return this.handleArtifactEnd(request);
+      if (request.method === 'GET'  && url.pathname === '/events')         return this.handleRead(url);
+      if (request.method === 'GET'  && url.pathname.startsWith('/artifact/')) return this.handleGetArtifact(url);
       return new Response('Not found', { status: 404 });
     } catch (err) {
       return new Response(JSON.stringify({ error: err.message }), {
@@ -228,7 +265,6 @@ export class EventLedger {
     }
   }
 
-  // Generic append — used for messages
   async handleAppend(request) {
     const partial = await request.json();
     const event   = await this.state.storage.transaction(async (txn) => {
@@ -241,11 +277,17 @@ export class EventLedger {
     return doResponse(event, 201);
   }
 
-  // Idempotent intent creation
   async handleArtifactBegin(request) {
-    const { idempotency_key, ...partial } = await request.json();
+    const { idempotency_key, content, ...partial } = await request.json();
 
-    // Check for existing intent via idempotency key
+    // D. Content size — DO-level defense in depth
+    if (content && utf8ByteLength(content) > MAX_ARTIFACT_BYTES) {
+      return new Response(JSON.stringify({ error: 'Content exceeds DO storage cap' }), {
+        status: 413, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // A. ikey is already scoped as {principal}:{caller_key} by the main worker
     const existingId = await this.state.storage.get(`ikey:${idempotency_key}`);
     if (existingId) {
       const intent     = JSON.parse(await this.state.storage.get(`intent:${existingId}`));
@@ -254,7 +296,6 @@ export class EventLedger {
       return doResponse({ intent, completion, is_retry: true }, 200);
     }
 
-    // New intent — atomically assign seq, persist event, index by ikey
     const intent = await this.state.storage.transaction(async (txn) => {
       const seq      = ((await txn.get('__seq__')) ?? 0) + 1;
       const complete = {
@@ -263,7 +304,8 @@ export class EventLedger {
         timestamp:       new Date().toISOString(),
         type:            'artifact_intent',
         idempotency_key,
-        ...partial,      // principal, path, commit_message, content
+        content,
+        ...partial,
       };
       const ekey = `event:${String(seq).padStart(10, '0')}`;
       await txn.put('__seq__', seq);
@@ -276,31 +318,31 @@ export class EventLedger {
     return doResponse({ intent, completion: null, is_retry: false }, 201);
   }
 
-  // Append completion event — idempotent (safe to call twice)
+  // B. Completion uniqueness — check AND write are inside one transaction
   async handleArtifactEnd(request) {
     const { intent_id, ...partial } = await request.json();
 
-    // Already completed? Return existing completion without creating a duplicate
-    const existing = await this.state.storage.get(`completion:${intent_id}`);
-    if (existing) return doResponse(JSON.parse(existing), 200);
+    const result = await this.state.storage.transaction(async (txn) => {
+      // Existence check is inside the transaction — concurrent calls cannot both write
+      const existing = await txn.get(`completion:${intent_id}`);
+      if (existing) return { wrote: false, completion: JSON.parse(existing) };
 
-    const completion = await this.state.storage.transaction(async (txn) => {
       const seq      = ((await txn.get('__seq__')) ?? 0) + 1;
       const complete = {
         id:        crypto.randomUUID(),
         seq,
         timestamp: new Date().toISOString(),
         intent_id,
-        ...partial, // type (artifact_committed|artifact_failed), principal, intent_seq, path, sha|error
+        ...partial,
       };
       const ekey = `event:${String(seq).padStart(10, '0')}`;
       await txn.put('__seq__', seq);
-      await txn.put(ekey,                        JSON.stringify(complete));
-      await txn.put(`completion:${intent_id}`,   JSON.stringify(complete));
-      return complete;
+      await txn.put(ekey,                      JSON.stringify(complete));
+      await txn.put(`completion:${intent_id}`, JSON.stringify(complete));
+      return { wrote: true, completion: complete };
     });
 
-    return doResponse(completion, 201);
+    return doResponse(result.completion, result.wrote ? 201 : 200);
   }
 
   async handleRead(url) {
@@ -310,12 +352,31 @@ export class EventLedger {
     const events   = [...entries.values()].map(v => JSON.parse(v));
     return doResponse({ events, count: events.length }, 200);
   }
+
+  // E. Direct lifecycle query — reads intent + completion by ID without event scan
+  async handleGetArtifact(url) {
+    const intentId   = url.pathname.replace('/artifact/', '');
+    const intentRaw  = await this.state.storage.get(`intent:${intentId}`);
+    if (!intentRaw) return doResponse({ error: 'Not found' }, 404);
+    const intent     = JSON.parse(intentRaw);
+    const compRaw    = await this.state.storage.get(`completion:${intentId}`);
+    const completion = compRaw ? JSON.parse(compRaw) : null;
+    // Return lifecycle state explicitly so clients never have to infer
+    const state      = completion
+      ? (completion.type === 'artifact_committed' ? 'committed' : 'failed')
+      : 'pending';
+    return doResponse({ intent, completion, state }, 200);
+  }
 }
 
 function doResponse(data, status) {
   return new Response(JSON.stringify(data), {
     status, headers: { 'Content-Type': 'application/json' }
   });
+}
+
+function utf8ByteLength(str) {
+  return new TextEncoder().encode(str).length;
 }
 
 // ── DO client helpers ─────────────────────────────────────────────────────────
@@ -354,7 +415,13 @@ async function doReadSince(after, env) {
   return r.json();
 }
 
-// ── Path sanitization — strict ────────────────────────────────────────────────
+async function doGetArtifact(intentId, env) {
+  const r = await getLedger(env).fetch(`http://internal/artifact/${intentId}`);
+  if (!r.ok) throw new Error(`Ledger get-artifact failed: ${await r.text()}`);
+  return r.json();
+}
+
+// ── Path sanitization ─────────────────────────────────────────────────────────
 
 function sanitizePath(raw) {
   if (!raw || typeof raw !== 'string') return null;
@@ -364,19 +431,16 @@ function sanitizePath(raw) {
   try { decoded = decodeURIComponent(raw); } catch { return null; }
 
   const segments = decoded.split('/');
-
   if (segments.some(s => /[\x00-\x1f\x7f]/.test(s))) return null;
-  if (segments.some(s => s === '.' || s === '..'))     return null; // reject, not filter
+  if (segments.some(s => s === '.' || s === '..'))     return null;
 
   const clean = segments.filter((s, i) =>
     !(i === 0 && s === '') && !(i === segments.length - 1 && s === '')
   );
-
   if (clean.length === 0 || clean.some(s => s === '')) return null;
 
   const joined = clean.join('/');
   if (!ALLOWED_PREFIXES.some(p => joined.startsWith(p))) return null;
-
   return joined;
 }
 
@@ -401,7 +465,7 @@ async function commitToGitHub(path, content, message, env) {
   const headers = {
     'Authorization': `token ${env.GITHUB_TOKEN}`,
     'Content-Type':  'application/json',
-    'User-Agent':    'sphera-bridge/0.0.6'
+    'User-Agent':    'sphera-bridge/0.0.7'
   };
 
   let sha;
@@ -423,10 +487,6 @@ async function commitToGitHub(path, content, message, env) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function utf8ByteLength(str) {
-  return new TextEncoder().encode(str).length;
-}
 
 async function readBodyWithLimit(request, limit) {
   const reader = request.body?.getReader();
