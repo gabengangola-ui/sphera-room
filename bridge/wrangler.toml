@@ -2,24 +2,20 @@ name = "sphera-bridge"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# KV namespace for the event log
-# Create with: wrangler kv:namespace create EVENTS
-# Then replace the id below
-[[kv_namespaces]]
-binding = "EVENTS"
-id      = "REPLACE_WITH_KV_NAMESPACE_ID"
-
-# Durable Object — single-writer event sequencer
-# Guarantees monotonic, gap-free sequence numbers across all concurrent writers
+# Durable Object — owns the canonical event ledger
+# Atomically assigns sequence numbers and persists events in one transaction
 [[durable_objects.bindings]]
-name       = "SEQUENCER"
-class_name = "EventSequencer"
+name       = "LEDGER"
+class_name = "EventLedger"
 
 [[migrations]]
 tag         = "v1"
-new_classes = ["EventSequencer"]
+new_classes = ["EventLedger"]
 
-# Secrets — set via CLI only, never hardcode:
+# Note: KV is no longer needed for the event log.
+# If you created an EVENTS KV namespace for v0.0.3, it can be removed.
+
+# Secrets — set via Cloudflare dashboard or CLI only, never in chat:
 #   wrangler secret put GITHUB_TOKEN   # fine-grained PAT: sphera-room, contents read+write
 #   wrangler secret put CLAUDE_KEY
 #   wrangler secret put SOBA_KEY
