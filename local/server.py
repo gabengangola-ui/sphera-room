@@ -358,8 +358,7 @@ async def room_state(authorization: str = Header(default="")):
                "agents":{"available":agents_avail,"busy":agents_busy},
                "pending_decisions":pending_dec})
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
+# NOTE: uvicorn.run() moved to end of file after ALL route declarations (Soba bug fix)
 
 # ── Agent self-assignment (capability-driven auto-claim) ──────────────────────
 @app.post("/work/{wid}/auto-claim")
@@ -452,3 +451,7 @@ async def work_queue(authorization: str = Header(default="")):
                 "total": len(items)
             })
     return ok({"queue": result, "ts": now_iso()})
+
+if __name__ == "__main__":
+    # All routes declared above - safe to start server now
+    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
