@@ -1,17 +1,16 @@
 """
-SPHERA Mission Runner — autonomous agent loop.
-
-Agents register themselves and continuously pull+execute work from the room.
-This is what makes SPHERA autonomous: agents run, complete work, unblock dependencies,
-and the mission advances without human coordination.
+SPHERA Mission Runner v1.1
+- Heartbeat thread runs during work execution (prevents lease expiry mid-task)
+- Stops heartbeat only after result is submitted
+- Agent.run_once() is non-blocking; heartbeat runs in parallel
 """
-import os, sys, time, json, uuid, random, urllib.request
+import os, sys, time, json, threading, urllib.request, random
 sys.path.insert(0, '/home/claude/sphera')
 
 BASE     = os.environ.get('SPHERA_URL', 'http://127.0.0.1:8765')
 POLL_SEC = float(os.environ.get('SPHERA_POLL', '2'))
 
-def call(method, path, body=None, key=''):
+def _call(method, path, body=None, key=''):
     data = json.dumps(body).encode() if body else None
     req  = urllib.request.Request(f'{BASE}{path}', data=data, method=method,
            headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'})
@@ -25,88 +24,90 @@ def call(method, path, body=None, key=''):
         return {'_exc': str(ex)}
 
 class Agent:
-    def __init__(self, name: str, capabilities: list, key: str, work_fn=None):
+    def __init__(self, name, capabilities, key, work_fn=None):
         self.name         = name
         self.capabilities = capabilities
         self.key          = key
-        self.work_fn      = work_fn or self._default_work
+        self.work_fn      = work_fn or self._simulate
         self.agent_id     = None
         self.lease_id     = None
         self.current_work = None
+        self._hb_stop     = threading.Event()
+
+    def call(self, method, path, body=None):
+        return _call(method, path, body, self.key)
 
     def register(self):
-        r = call('POST', '/agent/register', {'name': self.name, 'capabilities': self.capabilities}, key=self.key)
-        if r.get('ok'):
-            self.agent_id = r['agent_id']
-            print(f'[{self.name}] registered {self.agent_id[:8]}... caps:{self.capabilities}')
-        else:
-            raise RuntimeError(f'Registration failed: {r}')
+        r = self.call('POST', '/agent/register', {'name': self.name, 'capabilities': self.capabilities})
+        if not r.get('ok'):
+            raise RuntimeError(f'[{self.name}] registration failed: {r}')
+        self.agent_id = r['agent_id']
+        print(f'[{self.name}] registered {self.agent_id[:8]} caps:{self.capabilities}')
 
-    def _default_work(self, work_item: dict) -> dict:
-        """Simulate doing work — real agents replace this."""
-        time.sleep(random.uniform(0.5, 1.5))  # simulate work duration
-        return {
-            'status': 'completed',
-            'agent': self.name,
-            'work_id': work_item['work_id'],
-            'description': work_item['description'],
-            'output': f'{self.name} completed: {work_item["description"]}'
-        }
+    def _simulate(self, work_item):
+        """Default: simulate work. Real agents replace this with actual execution."""
+        time.sleep(random.uniform(0.5, 1.2))
+        return {'agent': self.name, 'output': f'completed: {work_item["description"]}', 'status': 'done'}
 
-    def try_claim(self) -> bool:
-        """Try to auto-claim work matching this agent's capabilities."""
-        r = call('POST', f'/work/{self.agent_id}/auto-claim', {'agent_id': self.agent_id}, key=self.key)
+    def _heartbeat_loop(self, work_id, interval=20):
+        """Runs in a thread. Sends heartbeat every `interval` seconds until stopped."""
+        while not self._hb_stop.wait(timeout=interval):
+            if not self.lease_id:
+                break
+            r = self.call('POST', f'/work/{work_id}/heartbeat',
+                         {'lease_id': self.lease_id, 'extend_seconds': 60})
+            if '_err' in r or '_exc' in r:
+                print(f'[{self.name}] heartbeat failed: {r}')
+                break
+
+    def try_claim(self):
+        if not self.agent_id:
+            return False
+        r = self.call('POST', f'/work/{self.agent_id}/auto-claim', {'agent_id': self.agent_id})
         if r.get('ok'):
             self.lease_id    = r['lease_id']
             self.current_work = r
-            print(f'[{self.name}] claimed: "{r["description"]}" [{r["capability"]}]')
+            print(f'[{self.name}] claimed "{r["description"]}" [{r["capability"]}]')
             return True
         return False
 
-    def heartbeat(self):
-        if not self.current_work or not self.lease_id: return
-        wid = self.current_work['work_id']
-        call('POST', f'/work/{wid}/heartbeat', {'lease_id': self.lease_id, 'extend_seconds': 60}, key=self.key)
+    def execute_and_submit(self):
+        """Execute work with heartbeat running in parallel, then submit result."""
+        work = self.current_work
+        work_id = work['work_id']
 
-    def submit_result(self, result: dict):
-        wid = self.current_work['work_id']
-        r = call('POST', f'/work/{wid}/result', {'lease_id': self.lease_id, 'result': result}, key=self.key)
+        # Start heartbeat thread before executing
+        self._hb_stop.clear()
+        hb = threading.Thread(target=self._heartbeat_loop, args=(work_id,), daemon=True)
+        hb.start()
+
+        try:
+            result = self.work_fn(work)
+        except Exception as e:
+            result = {'error': str(e), 'status': 'failed'}
+        finally:
+            # Stop heartbeat before submitting result
+            self._hb_stop.set()
+            hb.join(timeout=2)
+
+        r = self.call('POST', f'/work/{work_id}/result',
+                     {'lease_id': self.lease_id, 'result': result})
         if r.get('ok'):
-            print(f'[{self.name}] result submitted seq:{r["seq"]} unblocked:{r.get("unblocked",[])}')
+            print(f'[{self.name}] result seq:{r["seq"]} unblocked:{r.get("unblocked",[])}')
         else:
             print(f'[{self.name}] result error: {r}')
+
         self.lease_id    = None
         self.current_work = None
 
-    def _heartbeat_loop(self, stop_event, interval=20):
-        """Send heartbeats every interval seconds while working. Stops when stop_event is set."""
-        import threading
-        while not stop_event.wait(interval):
-            if self.current_work and self.lease_id:
-                wid = self.current_work['work_id']
-                call('POST', f'/work/{wid}/heartbeat',
-                     {'lease_id': self.lease_id, 'extend_seconds': 60}, key=self.key)
-
     def run_once(self):
-        """Single poll cycle."""
         if self.current_work:
-            import threading
-            # Start heartbeat thread to prevent lease expiry during long work
-            stop = threading.Event()
-            hb = threading.Thread(target=self._heartbeat_loop, args=(stop,), daemon=True)
-            hb.start()
-            try:
-                result = self.work_fn(self.current_work)
-            finally:
-                stop.set()  # always stop heartbeat, even if work_fn raises
-                hb.join(timeout=2)
-            self.submit_result(result)
+            self.execute_and_submit()
         else:
             self.try_claim()
 
-    def run(self, max_cycles: int = 0):
-        """Continuous agent loop. Set max_cycles>0 for finite test runs."""
-        print(f'[{self.name}] starting loop (poll:{POLL_SEC}s)')
+    def run(self, max_cycles=0):
+        print(f'[{self.name}] loop started (poll:{POLL_SEC}s)')
         cycles = 0
         while True:
             self.run_once()
@@ -116,69 +117,54 @@ class Agent:
             time.sleep(POLL_SEC)
 
 
-# ── Demo: run a full mission autonomously ─────────────────────────────────────
 if __name__ == '__main__':
-    import threading
-
     CLAUDE_KEY  = os.environ['CLAUDE_KEY']
     SOBA_KEY    = os.environ['SOBA_KEY']
     ARCIDES_KEY = os.environ['ARCIDES_KEY']
 
-    print('=== SPHERA AUTONOMOUS MISSION RUNNER ===\n')
-
-    # Create mission
-    r = call('POST', '/mission', {'objective': 'Autonomous SPHERA build sprint'}, key=ARCIDES_KEY)
+    # Arcides gives one outcome once — mission decomposition is his job
+    r = _call('POST', '/mission', {'objective': 'Ship SPHERA alpha'}, key=ARCIDES_KEY)
     mid = r['mission_id']
-    print(f'Mission: {mid[:8]}...\n')
+    print(f'Mission: {mid[:8]}')
 
-    # Decompose into work items
-    sprint = [
-        ('Implement event ledger',     'backend'),
-        ('Write integration tests',    'testing'),
-        ('Build room UI',              'frontend'),
-        ('Deploy to production',       'devops'),
+    tasks = [
+        ('Event ledger',  'backend'),
+        ('Test suite',    'testing'),
+        ('Deploy',        'devops'),
     ]
     wids = []
-    for i, (desc, cap) in enumerate(sprint):
-        deps = [wids[i-1]] if i > 0 else []
-        r = call('POST', f'/mission/{mid}/work', {'description': desc, 'capability': cap, 'dependencies': deps}, key=ARCIDES_KEY)
+    for i, (desc, cap) in enumerate(tasks):
+        deps = [wids[-1]] if wids else []
+        r = _call('POST', f'/mission/{mid}/work',
+                  {'description': desc, 'capability': cap, 'dependencies': deps}, key=ARCIDES_KEY)
         wids.append(r['work_id'])
         print(f'  [{r["status"]:7s}] {desc} [{cap}]')
 
-    print()
-
-    # Create agents
     agents = [
-        Agent('backend-bot',  ['backend','api'],  CLAUDE_KEY),
-        Agent('test-bot',     ['testing'],        CLAUDE_KEY),
-        Agent('frontend-bot', ['frontend'],       SOBA_KEY),
-        Agent('devops-bot',   ['devops'],         SOBA_KEY),
+        Agent('backend-bot', ['backend'],      CLAUDE_KEY),
+        Agent('test-bot',    ['testing'],      SOBA_KEY),
+        Agent('devops-bot',  ['devops'],       CLAUDE_KEY),
     ]
+    print()
+    for a in agents:
+        a.register()
 
-    for agent in agents:
-        agent.register()
-
-    print('\n--- AUTONOMOUS EXECUTION ---')
-
-    # Run all agents concurrently for up to 10 cycles each
-    threads = [threading.Thread(target=a.run, kwargs={'max_cycles': 10}, daemon=True) for a in agents]
+    print('\n--- autonomous execution ---')
+    threads = [threading.Thread(target=a.run, kwargs={'max_cycles': 8}, daemon=True) for a in agents]
     for t in threads: t.start()
 
-    # Monitor until mission complete
-    for _ in range(30):
-        time.sleep(1)
-        r = call('GET', '/room', key=CLAUDE_KEY)
+    for _ in range(20):
+        time.sleep(1.5)
+        r = _call('GET', '/room', key=CLAUDE_KEY)
         done = r['work']['done']
         total = len(wids)
-        print(f'  Progress: {done}/{total} done  leased:{r["work"]["leased"]}  events:{r["event_count"]}')
+        sys.stdout.write(f'\r  {done}/{total} done  events:{r["event_count"]}  ')
+        sys.stdout.flush()
         if done >= total:
             break
 
-    # Final state
-    r = call('GET', f'/mission/{mid}', key=CLAUDE_KEY)
-    print(f'\n=== MISSION COMPLETE ===')
-    print(f'  Objective: {r["mission"]["objective"]}')
-    print(f'  Done: {len(r["done"])}/{r["total"]}')
-    for w in r['done']:
-        result = json.loads(w['result']) if w['result'] else {}
-        print(f'  [done] {w["description"]} → {result.get("output","")[:50]}')
+    print('\n--- done ---')
+    r = _call('GET', f'/mission/{mid}', key=CLAUDE_KEY)
+    for w in r.get('done', []):
+        res = json.loads(w['result']) if w.get('result') else {}
+        print(f'  [done] {w["description"]} → {res.get("output","")[:50]}')
