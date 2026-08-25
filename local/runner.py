@@ -78,11 +78,28 @@ class Agent:
         self.lease_id    = None
         self.current_work = None
 
+    def _heartbeat_loop(self, stop_event, interval=20):
+        """Send heartbeats every interval seconds while working. Stops when stop_event is set."""
+        import threading
+        while not stop_event.wait(interval):
+            if self.current_work and self.lease_id:
+                wid = self.current_work['work_id']
+                call('POST', f'/work/{wid}/heartbeat',
+                     {'lease_id': self.lease_id, 'extend_seconds': 60}, key=self.key)
+
     def run_once(self):
         """Single poll cycle."""
         if self.current_work:
-            # Execute current work
-            result = self.work_fn(self.current_work)
+            import threading
+            # Start heartbeat thread to prevent lease expiry during long work
+            stop = threading.Event()
+            hb = threading.Thread(target=self._heartbeat_loop, args=(stop,), daemon=True)
+            hb.start()
+            try:
+                result = self.work_fn(self.current_work)
+            finally:
+                stop.set()  # always stop heartbeat, even if work_fn raises
+                hb.join(timeout=2)
             self.submit_result(result)
         else:
             self.try_claim()
