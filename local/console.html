@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SPHERA Operator Console</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0a0a0f; color: #e0e0e0; font-family: 'SF Mono','Fira Code',monospace; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+/* Header */
+.header { background: #111118; border-bottom: 1px solid #1e1e2e; padding: 10px 16px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.logo { font-size: 16px; font-weight: 700; color: #7c6af7; letter-spacing: 2px; }
+.conn-status { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.dot { width: 7px; height: 7px; border-radius: 50%; }
+.dot.live { background: #22c55e; animation: pulse 2s infinite; }
+.dot.dead { background: #ef4444; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+.server-url { font-size: 11px; color: #555; margin-left: 8px; }
+.hdr-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+input.url-input { background: #0d0d14; border: 1px solid #1e1e2e; color: #e0e0e0; padding: 4px 8px; border-radius: 4px; font-family: inherit; font-size: 11px; width: 200px; }
+input.key-input { background: #0d0d14; border: 1px solid #1e1e2e; color: #e0e0e0; padding: 4px 8px; border-radius: 4px; font-family: inherit; font-size: 11px; width: 180px; }
+.btn { background: #7c6af7; color: white; border: none; border-radius: 4px; padding: 4px 12px; font-size: 11px; cursor: pointer; font-family: inherit; }
+.btn:hover { background: #6a5ae0; }
+.btn.sm { padding: 3px 8px; font-size: 10px; }
+.btn.danger { background: #ef4444; }
+.btn.success { background: #22c55e; color: #000; }
+
+/* Layout */
+.layout { display: flex; flex: 1; overflow: hidden; }
+
+/* Sidebar */
+.sidebar { width: 240px; background: #0d0d14; border-right: 1px solid #1e1e2e; display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0; }
+.sidebar-section { padding: 12px; border-bottom: 1px solid #1e1e2e; }
+.sidebar-section h3 { font-size: 10px; color: #444; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+.stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.stat { background: #161622; border-radius: 4px; padding: 8px; text-align: center; }
+.stat-val { font-size: 20px; font-weight: 700; color: #7c6af7; }
+.stat-val.green { color: #22c55e; }
+.stat-val.orange { color: #f59e0b; }
+.stat-val.red { color: #ef4444; }
+.stat-lbl { font-size: 9px; color: #555; margin-top: 2px; }
+.mission-list { overflow-y: auto; flex: 1; }
+.mission-item { padding: 8px 12px; border-bottom: 1px solid #111; cursor: pointer; }
+.mission-item:hover { background: #161622; }
+.mission-item.active { background: #161622; border-left: 2px solid #7c6af7; }
+.m-obj { font-size: 11px; color: #c0c0d8; line-height: 1.3; margin-bottom: 4px; }
+.m-prog { height: 2px; background: #1e1e2e; border-radius: 1px; overflow: hidden; }
+.m-prog-fill { height: 100%; background: #7c6af7; }
+.m-meta { font-size: 9px; color: #444; margin-top: 3px; display: flex; justify-content: space-between; }
+
+/* Main area */
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.tabs { display: flex; border-bottom: 1px solid #1e1e2e; flex-shrink: 0; }
+.tab { padding: 8px 16px; font-size: 11px; cursor: pointer; color: #555; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tab.active { color: #7c6af7; border-bottom-color: #7c6af7; }
+.tab-content { flex: 1; overflow-y: auto; padding: 12px 16px; }
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
+
+/* Events */
+.event { display: flex; gap: 8px; margin-bottom: 8px; animation: fi .2s; }
+@keyframes fi { from{opacity:0;transform:translateY(3px)} to{opacity:1;transform:none} }
+.ev-seq { font-size: 10px; color: #2a2a3a; min-width: 32px; text-align: right; padding-top: 2px; }
+.ev-body { flex: 1; }
+.ev-hdr { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
+.ev-p { font-size: 10px; font-weight: 700; }
+.ev-p.claude { color: #7c6af7; } .ev-p.soba { color: #06b6d4; } .ev-p.arcides { color: #f59e0b; } .ev-p.system { color: #333; }
+.ev-type { font-size: 9px; color: #333; background: #161622; padding: 1px 5px; border-radius: 2px; }
+.ev-time { font-size: 9px; color: #2a2a3a; margin-left: auto; }
+.ev-content { font-size: 12px; color: #b0b0c8; background: #111118; padding: 6px 10px; border-radius: 0 5px 5px 5px; border-left: 2px solid; white-space: pre-wrap; line-height: 1.4; }
+.ev-content.claude { border-left-color: #7c6af7; } .ev-content.soba { border-left-color: #06b6d4; }
+.ev-content.arcides { border-left-color: #f59e0b; } .ev-content.system { border-left-color: #1e1e2e; color: #444; font-size: 10px; }
+
+/* Work items */
+.work-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.work-table th { background: #0d0d14; padding: 6px 8px; text-align: left; font-size: 9px; color: #444; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #1e1e2e; }
+.work-table td { padding: 6px 8px; border-bottom: 1px solid #111; }
+.work-table tr:hover td { background: #111118; }
+.badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 9px; }
+.badge.ready   { background: #06b6d422; color: #06b6d4; }
+.badge.blocked { background: #ef444422; color: #ef4444; }
+.badge.leased  { background: #7c6af722; color: #7c6af7; }
+.badge.done    { background: #22c55e22; color: #22c55e; }
+
+/* Agents */
+.agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); gap: 8px; }
+.agent-card { background: #161622; border-radius: 6px; padding: 10px; border: 1px solid #1e1e2e; }
+.agent-name { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+.agent-caps { font-size: 10px; color: #555; margin-bottom: 6px; }
+.agent-status { font-size: 10px; }
+.agent-status.available { color: #22c55e; }
+.agent-status.busy { color: #f59e0b; }
+
+/* Compose */
+.compose { border-top: 1px solid #1e1e2e; padding: 10px 16px; display: flex; gap: 8px; align-items: flex-end; flex-shrink: 0; }
+.compose textarea { flex: 1; background: #111118; border: 1px solid #1e1e2e; color: #e0e0e0; padding: 8px 10px; border-radius: 5px; font-family: inherit; font-size: 12px; resize: none; outline: none; }
+.compose textarea:focus { border-color: #7c6af7; }
+
+/* Decisions panel */
+.decision-card { background: #161622; border: 1px solid #f59e0b33; border-radius: 6px; padding: 10px; margin-bottom: 8px; }
+.decision-scope { color: #f59e0b; font-size: 11px; font-weight: 600; margin-bottom: 4px; }
+.decision-meta { font-size: 10px; color: #555; margin-bottom: 6px; }
+.decision-actions { display: flex; gap: 6px; }
+
+/* Quick actions */
+.quick-panel { padding: 12px; border-bottom: 1px solid #1e1e2e; }
+.form-row { display: flex; gap: 6px; margin-bottom: 6px; }
+.form-row input, .form-row select { flex: 1; background: #0d0d14; border: 1px solid #1e1e2e; color: #e0e0e0; padding: 5px 8px; border-radius: 4px; font-family: inherit; font-size: 11px; }
+.empty { color: #333; font-size: 11px; text-align: center; padding: 30px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">⬡ SPHERA</div>
+  <div class="conn-status">
+    <div class="dot" id="conn-dot"></div>
+    <span id="conn-label">connecting...</span>
+  </div>
+  <div class="server-url" id="server-url"></div>
+  <div class="hdr-right">
+    <input class="url-input" id="srv-url" placeholder="http://localhost:8765" value="http://localhost:8765">
+    <input class="key-input" id="api-key" placeholder="Bearer key (CLAUDE_KEY)" type="password">
+    <button class="btn" onclick="connect()">Connect</button>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <h3>Room State</h3>
+      <div class="stat-grid">
+        <div class="stat"><div class="stat-val" id="s-events">—</div><div class="stat-lbl">Events</div></div>
+        <div class="stat"><div class="stat-val green" id="s-done">—</div><div class="stat-lbl">Done</div></div>
+        <div class="stat"><div class="stat-val orange" id="s-leased">—</div><div class="stat-lbl">Active</div></div>
+        <div class="stat"><div class="stat-val red" id="s-decisions">—</div><div class="stat-lbl">Decisions</div></div>
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <h3>Missions <button class="btn sm" onclick="showNewMission()">+ New</button></h3>
+      <div id="new-mission-form" style="display:none;margin-top:6px;">
+        <div class="form-row"><input id="m-obj" placeholder="Mission objective"></div>
+        <div class="form-row">
+          <button class="btn sm success" onclick="createMission()">Create</button>
+          <button class="btn sm" onclick="document.getElementById('new-mission-form').style.display='none'">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <div class="mission-list" id="mission-list">
+      <div class="empty">No missions</div>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('events')">Events</div>
+      <div class="tab" onclick="switchTab('work')">Work Items</div>
+      <div class="tab" onclick="switchTab('agents')">Agents</div>
+      <div class="tab" onclick="switchTab('decisions')">Decisions</div>
+    </div>
+
+    <div class="tab-content">
+      <div class="tab-pane active" id="tab-events">
+        <div id="events-list"></div>
+      </div>
+
+      <div class="tab-pane" id="tab-work">
+        <div style="margin-bottom:10px;display:flex;gap:6px;align-items:center;">
+          <span style="font-size:11px;color:#555;">Mission:</span>
+          <select id="work-mission-sel" onchange="loadWorkItems()" style="background:#0d0d14;border:1px solid #1e1e2e;color:#e0e0e0;padding:4px 8px;border-radius:4px;font-family:inherit;font-size:11px;">
+            <option value="">Select mission...</option>
+          </select>
+          <button class="btn sm" onclick="showAddWork()">+ Add work</button>
+        </div>
+        <div id="add-work-form" style="display:none;background:#161622;padding:10px;border-radius:6px;margin-bottom:10px;">
+          <div class="form-row"><input id="w-desc" placeholder="Description"></div>
+          <div class="form-row">
+            <input id="w-cap" placeholder="Capability (e.g. backend)">
+            <input id="w-deps" placeholder="Dep work IDs (comma sep)">
+          </div>
+          <div class="form-row">
+            <button class="btn sm success" onclick="addWork()">Add</button>
+            <button class="btn sm" onclick="document.getElementById('add-work-form').style.display='none'">Cancel</button>
+          </div>
+        </div>
+        <div id="work-list-container"><div class="empty">Select a mission</div></div>
+      </div>
+
+      <div class="tab-pane" id="tab-agents">
+        <div style="margin-bottom:10px;display:flex;gap:6px;">
+          <button class="btn sm" onclick="showRegisterAgent()">+ Register agent</button>
+        </div>
+        <div id="register-agent-form" style="display:none;background:#161622;padding:10px;border-radius:6px;margin-bottom:10px;">
+          <div class="form-row"><input id="a-name" placeholder="Agent name"></div>
+          <div class="form-row"><input id="a-caps" placeholder="Capabilities (comma sep, e.g. backend,api)"></div>
+          <div class="form-row">
+            <button class="btn sm success" onclick="registerAgent()">Register</button>
+            <button class="btn sm" onclick="document.getElementById('register-agent-form').style.display='none'">Cancel</button>
+          </div>
+        </div>
+        <div class="agent-grid" id="agent-grid"><div class="empty">No agents</div></div>
+      </div>
+
+      <div class="tab-pane" id="tab-decisions">
+        <div id="decisions-list"><div class="empty">No pending decisions</div></div>
+      </div>
+    </div>
+
+    <div class="compose">
+      <div style="font-size:10px;color:#444;margin-bottom:3px;">Post as authenticated principal:</div>
+      <textarea id="msg-input" rows="2" placeholder="Message the room... (Enter to send)"></textarea>
+      <button class="btn" onclick="postMessage()">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let BASE = '', KEY = '', cursor = 0, missions = [], pollTimer = null;
+
+function fmt(ts) {
+  try { return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
+  catch { return ''; }
+}
+
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Authorization': KEY, 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(BASE + path, opts);
+  return r.json();
+}
+
+function setConn(live, label) {
+  document.getElementById('conn-dot').className = 'dot ' + (live ? 'live' : 'dead');
+  document.getElementById('conn-label').textContent = label;
+  document.getElementById('server-url').textContent = live ? BASE : '';
+}
+
+async function connect() {
+  BASE = document.getElementById('srv-url').value.replace(/\/$/, '');
+  const rawKey = document.getElementById('api-key').value.trim();
+  KEY = rawKey.startsWith('Bearer ') ? rawKey : `Bearer ${rawKey}`;
+  setConn(false, 'connecting...');
+  try {
+    const r = await api('GET', '/room');
+    if (r.event_count !== undefined) {
+      setConn(true, 'LIVE');
+      cursor = 0;
+      startPolling();
+    } else {
+      setConn(false, 'auth failed');
+    }
+  } catch(e) {
+    setConn(false, 'unreachable');
+  }
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  poll();
+  pollTimer = setInterval(poll, 3000);
+}
+
+async function poll() {
+  try {
+    // Events
+    const evts = await api('GET', `/events?after=${cursor}`);
+    if (evts.events?.length) {
+      evts.events.forEach(appendEvent);
+      cursor = evts.cursor;
+    }
+    // Room state
+    const room = await api('GET', '/room');
+    document.getElementById('s-events').textContent = room.event_count;
+    document.getElementById('s-done').textContent = room.work?.done || 0;
+    document.getElementById('s-leased').textContent = room.work?.leased || 0;
+    document.getElementById('s-decisions').textContent = room.pending_decisions || 0;
+    // Missions
+    const ml = await api('GET', '/missions');
+    missions = ml.missions || [];
+    renderMissions();
+    // Agents
+    const al = await api('GET', '/agents');
+    renderAgents(al.agents || []);
+    // Decisions
+    const dl = await api('GET', '/decisions');
+    renderDecisions((dl.decisions || []).filter(d => d.status === 'pending'));
+  } catch(e) {
+    setConn(false, 'lost');
+  }
+}
+
+function appendEvent(ev) {
+  const list = document.getElementById('events-list');
+  const d = document.createElement('div');
+  d.className = 'event';
+  const c = ev.content || ev.objective || ev.description || ev.scope || ev.work_id?.slice(0,8) || '';
+  d.innerHTML = `
+    <div class="ev-seq">${ev.seq}</div>
+    <div class="ev-body">
+      <div class="ev-hdr">
+        <span class="ev-p ${ev.principal}">${ev.principal}</span>
+        <span class="ev-type">${ev.type}</span>
+        <span class="ev-time">${fmt(ev.ts || ev.timestamp)}</span>
+      </div>
+      <div class="ev-content ${ev.principal}">${String(c).replace(/</g,'&lt;')}</div>
+    </div>`;
+  list.appendChild(d);
+  list.scrollTop = list.scrollHeight;
+}
+
+function renderMissions() {
+  const el = document.getElementById('mission-list');
+  const sel = document.getElementById('work-mission-sel');
+  if (!missions.length) { el.innerHTML = '<div class="empty">No missions</div>'; return; }
+  el.innerHTML = missions.map(m => {
+    const pct = m.total ? Math.round(m.done_count/m.total*100) : 0;
+    return `<div class="mission-item" onclick="selectMission('${m.mission_id}')">
+      <div class="m-obj">${m.objective}</div>
+      <div class="m-prog"><div class="m-prog-fill" style="width:${pct}%"></div></div>
+      <div class="m-meta"><span>${m.done_count}/${m.total} done</span><span>${m.status}</span></div>
+    </div>`;
+  }).join('');
+  sel.innerHTML = '<option value="">Select...</option>' +
+    missions.map(m => `<option value="${m.mission_id}">${m.objective.slice(0,40)}</option>`).join('');
+}
+
+function selectMission(mid) {
+  document.getElementById('work-mission-sel').value = mid;
+  switchTab('work');
+  loadWorkItems();
+}
+
+async function loadWorkItems() {
+  const mid = document.getElementById('work-mission-sel').value;
+  if (!mid) { document.getElementById('work-list-container').innerHTML = '<div class="empty">Select a mission</div>'; return; }
+  const r = await api('GET', `/mission/${mid}`);
+  const items = [...(r.ready||[]), ...(r.leased||[]), ...(r.blocked||[]), ...(r.done||[])];
+  if (!items.length) { document.getElementById('work-list-container').innerHTML = '<div class="empty">No work items</div>'; return; }
+  document.getElementById('work-list-container').innerHTML = `
+    <table class="work-table">
+      <thead><tr><th>Description</th><th>Capability</th><th>Status</th><th>Assigned</th></tr></thead>
+      <tbody>${items.map(w => `<tr>
+        <td>${w.description}</td>
+        <td><code style="font-size:10px;color:#7c6af7">${w.capability}</code></td>
+        <td><span class="badge ${w.status}">${w.status}</span></td>
+        <td style="font-size:10px;color:#555">${w.assigned_to?.slice(0,8) || '—'}</td>
+      </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+function renderAgents(agents) {
+  const el = document.getElementById('agent-grid');
+  if (!agents.length) { el.innerHTML = '<div class="empty">No agents registered</div>'; return; }
+  el.innerHTML = agents.map(a => {
+    const caps = typeof a.capabilities === 'string' ? JSON.parse(a.capabilities) : a.capabilities;
+    return `<div class="agent-card">
+      <div class="agent-name">${a.name}</div>
+      <div class="agent-caps">${Array.isArray(caps) ? caps.join(', ') : caps}</div>
+      <div class="agent-status ${a.status}">${a.status}${a.current_work_id ? ' · working' : ''}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderDecisions(pending) {
+  const el = document.getElementById('decisions-list');
+  if (!pending.length) { el.innerHTML = '<div class="empty">No pending decisions</div>'; return; }
+  el.innerHTML = pending.map(d => `
+    <div class="decision-card">
+      <div class="decision-scope">${d.scope}</div>
+      <div class="decision-meta">by ${d.requesting_principal} · target: ${d.target}</div>
+      <div class="decision-actions">
+        <button class="btn sm success" onclick="approveDecision('${d.request_id}')">✓ Approve</button>
+        <button class="btn sm danger" onclick="rejectDecision('${d.request_id}')">✗ Reject</button>
+      </div>
+    </div>`).join('');
+}
+
+async function postMessage() {
+  const inp = document.getElementById('msg-input');
+  const content = inp.value.trim();
+  if (!content || !BASE) return;
+  await api('POST', '/message', {content});
+  inp.value = '';
+}
+
+async function createMission() {
+  const obj = document.getElementById('m-obj').value.trim();
+  if (!obj) return;
+  await api('POST', '/mission', {objective: obj});
+  document.getElementById('m-obj').value = '';
+  document.getElementById('new-mission-form').style.display = 'none';
+  poll();
+}
+
+async function addWork() {
+  const mid = document.getElementById('work-mission-sel').value;
+  const desc = document.getElementById('w-desc').value.trim();
+  const cap = document.getElementById('w-cap').value.trim();
+  const depsRaw = document.getElementById('w-deps').value.trim();
+  const deps = depsRaw ? depsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  if (!mid || !desc || !cap) return;
+  await api('POST', `/mission/${mid}/work`, {description: desc, capability: cap, dependencies: deps});
+  document.getElementById('w-desc').value = '';
+  document.getElementById('w-cap').value = '';
+  document.getElementById('w-deps').value = '';
+  document.getElementById('add-work-form').style.display = 'none';
+  loadWorkItems();
+}
+
+async function registerAgent() {
+  const name = document.getElementById('a-name').value.trim();
+  const capsRaw = document.getElementById('a-caps').value.trim();
+  const caps = capsRaw.split(',').map(s => s.trim()).filter(Boolean);
+  if (!name || !caps.length) return;
+  await api('POST', '/agent/register', {name, capabilities: caps});
+  document.getElementById('a-name').value = '';
+  document.getElementById('a-caps').value = '';
+  document.getElementById('register-agent-form').style.display = 'none';
+  poll();
+}
+
+async function approveDecision(rid) {
+  const note = prompt('Approval note (optional):') || '';
+  await api('POST', `/decision/${rid}/approve`, {note});
+  poll();
+}
+
+async function rejectDecision(rid) {
+  const reason = prompt('Rejection reason:') || '';
+  await api('POST', `/decision/${rid}/reject`, {reason});
+  poll();
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab,.tab-pane').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab')[['events','work','agents','decisions'].indexOf(name)].classList.add('active');
+  document.getElementById(`tab-${name}`).classList.add('active');
+  if (name === 'work') loadWorkItems();
+}
+
+function showNewMission() { document.getElementById('new-mission-form').style.display = 'block'; document.getElementById('m-obj').focus(); }
+function showAddWork() { document.getElementById('add-work-form').style.display = 'block'; document.getElementById('w-desc').focus(); }
+function showRegisterAgent() { document.getElementById('register-agent-form').style.display = 'block'; document.getElementById('a-name').focus(); }
+
+document.getElementById('msg-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); postMessage(); }
+});
+
+// Auto-connect if URL/key already in inputs
+document.getElementById('srv-url').value = 'http://localhost:8765';
+setConn(false, 'enter API key and connect');
+</script>
+</body>
+</html>
