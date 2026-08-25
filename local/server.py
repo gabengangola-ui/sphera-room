@@ -1,320 +1,481 @@
 """
 SPHERA Local Server v0.1
-Runs on your machine. Same endpoints as the Cloudflare bridge.
-Ledger stored in SQLite. No cloud dependencies.
-
-Start: python server.py
-Default port: 8765
+SQLite-backed event ledger. FastAPI. Runs on localhost:8765.
+Implements: messages, decisions (fixed sentinel), missions, work items, leases.
+Recovery: on startup, materialises projections and expires stale leases.
 """
 
-import sqlite3, json, uuid, hashlib, os, time
+import hashlib, json, os, sqlite3, time, uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-from functools import wraps
-
-from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 import uvicorn
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 
-# ── Config ────────────────────────────────────────────────────────────────────
+DB_PATH   = os.environ.get("SPHERA_DB", "/home/claude/sphera-local/sphera.db")
+MAX_LEASE = 300  # seconds — max lease duration
 
-DB_PATH     = Path("sphera.db")
-PORT        = int(os.getenv("PORT", 8765))
-
-# Principal keys — set via environment variables, never hardcode
-PRINCIPAL_KEYS = {
-    os.getenv("CLAUDE_KEY",   "4fc8b916c3a28bb9cd2f3db961f8067a104be17f5cd0ccbc21abac7695b1a4c1"): "claude",
-    os.getenv("SOBA_KEY",     "b47899c1ac3cdf207ee7352b9593ef57f0970305a668282846dc40d315adbbed"): "soba",
-    os.getenv("ARCHIVES_KEY", "399cff5afa6bde5d30520627bca5e90383a6ae4e9dbef0997091311c6add294f"): "archives",
+# ── Auth ──────────────────────────────────────────────────────────────────────
+KEYS = {
+    os.environ.get("CLAUDE_KEY",   "claude-local-key"):   "claude",
+    os.environ.get("SOBA_KEY",     "soba-local-key"):     "soba",
+    os.environ.get("ARCIDES_KEY",  "arcides-local-key"):  "arcides",
 }
 
-MAX_MESSAGE_BYTES  = 10_000
-MAX_ARTIFACT_BYTES = 100_000
+def get_principal(authorization: str = Header(default="")) -> str:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Unauthorized")
+    token = authorization[7:].strip()
+    if token not in KEYS:
+        raise HTTPException(401, "Unauthorized")
+    return KEYS[token]
 
 # ── Database ──────────────────────────────────────────────────────────────────
-
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 def init_db():
     with get_db() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-                id        TEXT UNIQUE NOT NULL,
-                timestamp TEXT NOT NULL,
-                principal TEXT NOT NULL,
-                type      TEXT NOT NULL,
-                data      TEXT NOT NULL  -- JSON blob
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS ikeys (
-                ikey       TEXT PRIMARY KEY,
-                intent_id  TEXT NOT NULL
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS completions (
-                intent_id    TEXT PRIMARY KEY,
-                completion   TEXT NOT NULL  -- JSON blob
-            )
-        """)
-        db.commit()
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS events (
+            seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+            id        TEXT UNIQUE NOT NULL,
+            ts        TEXT NOT NULL,
+            principal TEXT NOT NULL,
+            type      TEXT NOT NULL,
+            payload   TEXT NOT NULL
+        );
 
-def append_event(principal: str, event_type: str, data: dict) -> dict:
-    event_id = str(uuid.uuid4())
-    ts = datetime.now(timezone.utc).isoformat()
-    full = {"id": event_id, "timestamp": ts, "principal": principal, "type": event_type, **data}
+        CREATE TABLE IF NOT EXISTS decision_state (
+            request_id      TEXT PRIMARY KEY,
+            status          TEXT NOT NULL,
+            requesting_principal TEXT NOT NULL,
+            scope           TEXT NOT NULL,
+            target          TEXT NOT NULL,
+            params_json     TEXT NOT NULL,
+            bound_digest    TEXT NOT NULL,
+            deadline        TEXT,
+            approval_seq    INTEGER,
+            claim_seq       INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS missions (
+            mission_id  TEXT PRIMARY KEY,
+            objective   TEXT NOT NULL,
+            owner       TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'active',
+            policy_json TEXT,
+            created_at  TEXT NOT NULL,
+            seq         INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS work_items (
+            work_id      TEXT PRIMARY KEY,
+            mission_id   TEXT NOT NULL,
+            description  TEXT NOT NULL,
+            capability   TEXT NOT NULL,
+            deps_json    TEXT NOT NULL DEFAULT '[]',
+            status       TEXT NOT NULL DEFAULT 'ready',
+            lease_id     TEXT,
+            lease_holder TEXT,
+            lease_expires TEXT,
+            result_seq   INTEGER,
+            seq          INTEGER
+        );
+        """)
+    recover_stale_leases()
+
+def recover_stale_leases():
+    """On startup, expire any leases that timed out while server was down."""
+    now = utcnow()
     with get_db() as db:
+        stale = db.execute(
+            "SELECT work_id, lease_id FROM work_items WHERE status='leased' AND lease_expires < ?", (now,)
+        ).fetchall()
+        for row in stale:
+            ev = new_event("system", "work_lease_expired", {"work_id": row["work_id"], "lease_id": row["lease_id"], "reason": "server_restart"})
+            append_event(db, ev)
+            db.execute("UPDATE work_items SET status='ready', lease_id=NULL, lease_holder=NULL, lease_expires=NULL WHERE work_id=?", (row["work_id"],))
+        if stale:
+            db.commit()
+            print(f"[recovery] expired {len(stale)} stale leases on startup")
+
+# ── Event helpers ─────────────────────────────────────────────────────────────
+def utcnow():
+    return datetime.now(timezone.utc).isoformat()
+
+def new_event(principal, type_, payload):
+    return {"id": str(uuid.uuid4()), "ts": utcnow(), "principal": principal, "type": type_, "payload": payload}
+
+def append_event(db, ev):
+    db.execute(
+        "INSERT INTO events (id, ts, principal, type, payload) VALUES (?,?,?,?,?)",
+        (ev["id"], ev["ts"], ev["principal"], ev["type"], json.dumps(ev["payload"]))
+    )
+    return ev
+
+def canonical_json(obj):
+    if isinstance(obj, dict):
+        return "{" + ",".join(f"{json.dumps(k)}:{canonical_json(obj[k])}" for k in sorted(obj.keys())) + "}"
+    if isinstance(obj, list):
+        return "[" + ",".join(canonical_json(i) for i in obj) + "]"
+    return json.dumps(obj)
+
+def sha256(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def compute_digest(scope, target, principal, params):
+    action = {"params": params, "principal": principal, "scope": scope, "target": target}
+    return sha256(canonical_json(action))
+
+# ── App startup/shutdown ──────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(title="SPHERA Local", lifespan=lifespan)
+
+def ok(data, status=200):
+    return JSONResponse(content=data, status_code=status)
+
+def err(msg, status=400):
+    return JSONResponse(content={"error": msg}, status_code=status)
+
+# ── Messages ──────────────────────────────────────────────────────────────────
+@app.post("/message")
+async def post_message(request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    body = await request.json()
+    content = body.get("content", "").strip()
+    if not content:
+        return err("content required")
+    # Block decision events through /message
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict) and str(parsed.get("type","")).startswith("decision_"):
+            return err("Decision events must use /decision endpoints", 400)
+    except Exception:
+        pass
+    ev = new_event(principal, "message", {"content": content})
+    with get_db() as db:
+        append_event(db, ev)
+        db.commit()
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+    return ok({"ok": True, "event_id": ev["id"], "seq": seq}, 201)
+
+# ── Events ────────────────────────────────────────────────────────────────────
+@app.get("/events")
+async def read_events(after: int = 0, authorization: str = Header(default="")):
+    get_principal(authorization)
+    with get_db() as db:
+        rows = db.execute("SELECT seq, id, ts, principal, type, payload FROM events WHERE seq > ? ORDER BY seq", (after,)).fetchall()
+    events = [{"seq": r["seq"], "id": r["id"], "timestamp": r["ts"], "principal": r["principal"],
+               "type": r["type"], **json.loads(r["payload"])} for r in rows]
+    cursor = events[-1]["seq"] if events else after
+    return ok({"events": events, "count": len(events), "cursor": cursor})
+
+# ── Decisions ─────────────────────────────────────────────────────────────────
+@app.post("/decision")
+async def decision_request(request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    body = await request.json()
+    scope  = body.get("scope")
+    target = body.get("target")
+    params = body.get("params")
+    if not scope or not isinstance(scope, str):   return err('"scope" required')
+    if not target or not isinstance(target, str): return err('"target" required')
+    if not isinstance(params, dict):              return err('"params" must be an object')
+    deadline = body.get("deadline")
+    if deadline:
+        try: datetime.fromisoformat(deadline.replace("Z","+00:00"))
+        except Exception: return err('"deadline" must be valid ISO timestamp')
+
+    digest     = compute_digest(scope, target, principal, params)
+    request_id = str(uuid.uuid4())
+    ev = new_event(principal, "decision_requested", {"request_id": request_id, "scope": scope, "target": target, "params": params, "payload_digest": digest, "deadline": deadline})
+
+    with get_db() as db:
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
         db.execute(
-            "INSERT INTO events (id, timestamp, principal, type, data) VALUES (?,?,?,?,?)",
-            (event_id, ts, principal, event_type, json.dumps(full))
+            "INSERT INTO decision_state (request_id,status,requesting_principal,scope,target,params_json,bound_digest,deadline) VALUES (?,?,?,?,?,?,?,?)",
+            (request_id, "pending", principal, scope, target, json.dumps(params), digest, deadline)
         )
         db.commit()
-    # Fetch back to get autoincrement seq
+    return ok({"ok": True, "request_id": request_id, "seq": seq, "payload_digest": digest}, 201)
+
+@app.post("/decision/{request_id}/approve")
+async def decision_approve(request_id: str, request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    if principal != "arcides":
+        raise HTTPException(403, "Only arcides may approve decisions")
+    body = await request.json()
     with get_db() as db:
-        row = db.execute("SELECT seq FROM events WHERE id=?", (event_id,)).fetchone()
-        full["seq"] = row["seq"]
-    return full
-
-def read_events_since(after: int) -> list:
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT seq, data FROM events WHERE seq > ? ORDER BY seq ASC", (after,)
-        ).fetchall()
-    events = []
-    for row in rows:
-        e = json.loads(row["data"])
-        e["seq"] = row["seq"]
-        events.append(e)
-    return events
-
-# ── App ───────────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="SPHERA Local Server", version="0.1")
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["*"], allow_headers=["*"])
-
-def auth(authorization: str = Header(None)) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Unauthorized")
-    token = authorization[7:].strip()
-    principal = PRINCIPAL_KEYS.get(token)
-    if not principal:
-        raise HTTPException(401, "Unauthorized")
-    return principal
-
-# ── POST /message ─────────────────────────────────────────────────────────────
-
-@app.post("/message")
-async def post_message(request: Request, authorization: str = Header(None)):
-    principal = auth(authorization)
-    body = await request.body()
-    if len(body) > MAX_MESSAGE_BYTES:
-        raise HTTPException(413, f"Message exceeds {MAX_MESSAGE_BYTES} byte limit")
-    data = json.loads(body)
-    content = data.get("content", "").strip()
-    if not content:
-        raise HTTPException(400, '"content" must be a non-empty string')
-    event = append_event(principal, "message", {"content": content})
-    return {"ok": True, "event_id": event["id"], "seq": event["seq"]}
-
-# ── GET /events ───────────────────────────────────────────────────────────────
-
-@app.get("/events")
-async def get_events(after: int = 0, authorization: str = Header(None)):
-    auth(authorization)
-    events = read_events_since(after)
-    cursor = events[-1]["seq"] if events else after
-    return {"events": events, "count": len(events), "cursor": cursor}
-
-# ── POST /artifact ────────────────────────────────────────────────────────────
-
-@app.post("/artifact")
-async def post_artifact(request: Request, authorization: str = Header(None)):
-    principal = auth(authorization)
-    body = await request.body()
-    data = json.loads(body)
-
-    path    = data.get("path", "")
-    content = data.get("content", "")
-    msg     = data.get("commit_message", "") or f"{principal}: publish {path}"
-    ikey    = data.get("idempotency_key") or str(uuid.uuid4())
-    scoped  = f"{principal}:{ikey}"
-
-    if not path: raise HTTPException(400, '"path" required')
-    if not content: raise HTTPException(400, '"content" required')
-    if len(content.encode()) > MAX_ARTIFACT_BYTES:
-        raise HTTPException(413, "Content exceeds 100KB limit")
-
-    # Allowed path prefixes
-    clean = path.lstrip("/")
-    if not any(clean.startswith(p) for p in ["artifacts/", "sessions/"]):
-        clean = f"artifacts/{clean}"
-
-    # Idempotency check
-    with get_db() as db:
-        row = db.execute("SELECT intent_id FROM ikeys WHERE ikey=?", (scoped,)).fetchone()
-
-    if row:
-        intent_id = row["intent_id"]
-        with get_db() as db:
-            comp = db.execute("SELECT completion FROM completions WHERE intent_id=?", (intent_id,)).fetchone()
-        if comp:
-            c = json.loads(comp["completion"])
-            if c["type"] == "artifact_committed":
-                return {"ok": True, "idempotent": True, "sha": c.get("sha"), "event_id": c["id"], "seq": c["seq"]}
-            return JSONResponse({"ok": False, "error": "Previous attempt failed. Use a new idempotency_key."}, 409)
-        # No completion yet — find the intent event
-        with get_db() as db:
-            row2 = db.execute("SELECT data FROM events WHERE id=?", (intent_id,)).fetchone()
-        intent = json.loads(row2["data"]) if row2 else {"id": intent_id}
-    else:
-        # New intent — record it
-        intent = append_event(principal, "artifact_intent", {
-            "path": clean, "commit_message": msg,
-            "content": content, "idempotency_key": scoped
-        })
-        with get_db() as db:
-            db.execute("INSERT INTO ikeys VALUES (?,?)", (scoped, intent["id"]))
+        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
+        if not row:            return err("Decision not found", 404)
+        if row["status"] != "pending": return err(f"Cannot approve: status is '{row['status']}'", 409)
+        if row["deadline"] and utcnow() > row["deadline"]:
+            db.execute("UPDATE decision_state SET status='expired' WHERE request_id=?", (request_id,))
+            ev = new_event("system", "decision_expired", {"request_id": request_id})
+            append_event(db, ev)
             db.commit()
-
-    # Write to local filesystem (artifacts/ in current directory)
-    artifact_path = Path(clean)
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_path.write_text(content, encoding="utf-8")
-    digest = hashlib.sha256(content.encode()).hexdigest()
-
-    # Record committed
-    committed = append_event(principal, "artifact_committed", {
-        "intent_id": intent["id"], "intent_seq": intent.get("seq"),
-        "path": clean, "commit_message": msg, "sha": digest
-    })
-    with get_db() as db:
-        db.execute("INSERT INTO completions VALUES (?,?)",
-                   (intent["id"], json.dumps(committed)))
+            return err("Decision has already expired", 410)
+        ev = new_event(principal, "decision_approved", {"request_id": request_id, "bound_digest": row["bound_digest"], "note": body.get("note")})
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+        db.execute("UPDATE decision_state SET status='approved', approval_seq=? WHERE request_id=?", (seq, request_id))
         db.commit()
+    return ok({"ok": True, "seq": seq, "request_id": request_id}, 201)
 
-    return {"ok": True, "event_id": committed["id"], "seq": committed["seq"],
-            "intent_seq": intent.get("seq"), "sha": digest}
-
-# ── GET /artifact/:intent_id ─────────────────────────────────────────────────
-
-@app.get("/artifact/{intent_id}")
-async def get_artifact(intent_id: str, authorization: str = Header(None)):
-    auth(authorization)
+@app.post("/decision/{request_id}/reject")
+async def decision_reject(request_id: str, request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    if principal != "arcides":
+        raise HTTPException(403, "Only arcides may reject decisions")
+    body = await request.json()
     with get_db() as db:
-        row = db.execute("SELECT data FROM events WHERE id=?", (intent_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Intent not found")
-    intent = json.loads(row["data"])
+        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
+        if not row:            return err("Decision not found", 404)
+        if row["status"] != "pending": return err(f"Cannot reject: status is '{row['status']}'", 409)
+        ev = new_event(principal, "decision_rejected", {"request_id": request_id, "reason": body.get("reason")})
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+        db.execute("UPDATE decision_state SET status='rejected' WHERE request_id=?", (request_id,))
+        db.commit()
+    return ok({"ok": True, "seq": seq, "request_id": request_id}, 201)
+
+@app.post("/decision/{request_id}/claim")
+async def decision_claim(request_id: str, request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    body      = await request.json()
+    params    = body.get("params")
+    if not isinstance(params, dict): return err('"params" required to verify digest')
+
     with get_db() as db:
-        comp = db.execute("SELECT completion FROM completions WHERE intent_id=?", (intent_id,)).fetchone()
-    completion = json.loads(comp["completion"]) if comp else None
-    state = ("committed" if completion and completion["type"] == "artifact_committed"
-             else "failed" if completion else "pending")
-    return {"intent": intent, "completion": completion, "state": state}
+        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
+        if not row:             return err("Decision not found", 404)
+        if row["status"] != "approved": return err(f"Cannot claim: status is '{row['status']}'", 409)
+        if row["requesting_principal"] != principal:
+            raise HTTPException(403, "Only the requesting principal may claim")
+        if row["deadline"] and utcnow() > row["deadline"]:
+            db.execute("UPDATE decision_state SET status='expired' WHERE request_id=?", (request_id,))
+            ev = new_event("system", "decision_expired", {"request_id": request_id})
+            append_event(db, ev)
+            db.commit()
+            return err("Decision has expired", 410)
+        # Digest verification — separate from params, no sentinel pollution
+        computed_digest = compute_digest(row["scope"], row["target"], principal, params)
+        if computed_digest != row["bound_digest"]:
+            return err("Payload digest mismatch: params do not match approved action", 422)
+        ev = new_event(principal, "decision_claimed", {"request_id": request_id})
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+        db.execute("UPDATE decision_state SET status='claimed', claim_seq=? WHERE request_id=?", (seq, request_id))
+        db.commit()
+    return ok({"ok": True, "seq": seq, "request_id": request_id}, 201)
 
-# ── POST /mcp — MCP Streamable HTTP ──────────────────────────────────────────
+@app.post("/decision/{request_id}/consume")
+async def decision_consume(request_id: str, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    with get_db() as db:
+        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
+        if not row:             return err("Decision not found", 404)
+        if row["status"] != "claimed": return err(f"Cannot consume: status is '{row['status']}'", 409)
+        if row["requesting_principal"] != principal: raise HTTPException(403, "Only requester may consume")
+        ev = new_event(principal, "decision_consumed", {"request_id": request_id})
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+        db.execute("UPDATE decision_state SET status='consumed' WHERE request_id=?", (request_id,))
+        db.commit()
+    return ok({"ok": True, "seq": seq}, 201)
 
-MCP_TOOLS = [
-    {
-        "name": "read_events",
-        "description": "Read messages and events from the SPHERA room ledger.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "after_cursor": {"type": "integer", "default": 0,
-                                 "description": "Return events with seq > after_cursor."}
-            }
-        }
-    },
-    {
-        "name": "post_message",
-        "description": "Post a message to the SPHERA room. Identity from authenticated connection.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "Message content."}
-            },
-            "required": ["content"]
-        }
-    }
-]
+@app.post("/decision/{request_id}/fail")
+async def decision_fail(request_id: str, request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    body = await request.json()
+    with get_db() as db:
+        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
+        if not row:             return err("Decision not found", 404)
+        if row["status"] != "claimed": return err(f"Cannot fail: status is '{row['status']}'", 409)
+        if row["requesting_principal"] != principal: raise HTTPException(403, "Only requester may report failure")
+        ev = new_event(principal, "execution_failed", {"request_id": request_id, "reason": body.get("error","unknown")})
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+        db.execute("UPDATE decision_state SET status='approved' WHERE request_id=?", (request_id,))
+        db.commit()
+    return ok({"ok": True, "seq": seq, "status": "approved"}, 201)
 
-@app.post("/mcp")
-async def mcp_endpoint(request: Request, authorization: str = Header(None)):
-    principal = auth(authorization)
-    try:
-        msg = await request.json()
-    except:
-        return mcp_err(None, -32700, "Parse error")
+@app.get("/decision/{request_id}")
+async def get_decision(request_id: str, authorization: str = Header(default="")):
+    get_principal(authorization)
+    with get_db() as db:
+        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
+        if not row: return err("Not found", 404)
+        return ok({"found": True, "request_id": request_id, "status": row["status"],
+                   "scope": row["scope"], "target": row["target"],
+                   "requesting_principal": row["requesting_principal"],
+                   "bound_digest": row["bound_digest"], "deadline": row["deadline"]})
 
-    jsonrpc = msg.get("jsonrpc")
-    id_     = msg.get("id")
-    method  = msg.get("method")
-    params  = msg.get("params", {})
+# ── Missions ──────────────────────────────────────────────────────────────────
+@app.post("/mission")
+async def create_mission(request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    body      = await request.json()
+    objective = body.get("objective")
+    if not objective: return err('"objective" required')
+    policy    = body.get("acceptance_policy", {})
+    mid       = str(uuid.uuid4())
+    ev = new_event(principal, "mission_created", {"mission_id": mid, "objective": objective,
+                    "owner": principal, "policy": policy})
+    with get_db() as db:
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+        db.execute("INSERT INTO missions (mission_id,objective,owner,status,policy_json,created_at,seq) VALUES (?,?,?,?,?,?,?)",
+                   (mid, objective, principal, "active", json.dumps(policy), utcnow(), seq))
+        db.commit()
+    return ok({"ok": True, "mission_id": mid, "seq": seq}, 201)
 
-    if jsonrpc != "2.0":
-        return mcp_err(id_, -32600, "Invalid Request")
-    if id_ is None:
-        return JSONResponse(None, 204)  # notification
+@app.post("/mission/{mission_id}/work")
+async def create_work_item(mission_id: str, request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    body = await request.json()
+    desc = body.get("description"); cap = body.get("capability"); deps = body.get("dependencies", [])
+    if not desc: return err('"description" required')
+    if not cap:  return err('"capability" required')
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM missions WHERE mission_id=?", (mission_id,)).fetchone():
+            return err("Mission not found", 404)
+    wid = str(uuid.uuid4())
+    status = "blocked" if deps else "ready"
+    ev = new_event(principal, "work_item_created", {"work_id": wid, "mission_id": mission_id,
+                    "description": desc, "capability": cap, "dependencies": deps, "status": status})
+    with get_db() as db:
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+        db.execute("INSERT INTO work_items (work_id,mission_id,description,capability,deps_json,status,seq) VALUES (?,?,?,?,?,?,?)",
+                   (wid, mission_id, desc, cap, json.dumps(deps), status, seq))
+        db.commit()
+    return ok({"ok": True, "work_id": wid, "status": status, "seq": seq}, 201)
 
-    if method == "initialize":
-        return mcp_ok(id_, {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "sphera-local", "version": "0.1"}
-        })
-    if method == "tools/list":
-        return mcp_ok(id_, {"tools": MCP_TOOLS})
-    if method == "tools/call":
-        name = params.get("name")
-        args = params.get("arguments", {})
+@app.post("/work/{work_id}/claim")
+async def claim_work(work_id: str, request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    body      = await request.json()
+    duration  = min(int(body.get("lease_seconds", 60)), MAX_LEASE)
+    with get_db() as db:
+        row = db.execute("SELECT * FROM work_items WHERE work_id=?", (work_id,)).fetchone()
+        if not row: return err("Work item not found", 404)
+        if row["status"] == "leased":
+            # Check if lease expired
+            if row["lease_expires"] and utcnow() < row["lease_expires"]:
+                return err(f"Already leased by {row['lease_holder']}", 409)
+            # Lease expired — expire it first
+            ev_exp = new_event("system", "work_lease_expired", {"work_id": work_id, "lease_id": row["lease_id"]})
+            append_event(db, ev_exp)
+            db.execute("UPDATE work_items SET status='ready', lease_id=NULL, lease_holder=NULL, lease_expires=NULL WHERE work_id=?", (work_id,))
+            db.commit()
+            row = db.execute("SELECT * FROM work_items WHERE work_id=?", (work_id,)).fetchone()
+        if row["status"] == "done":   return err("Work item is already done", 409)
+        if row["status"] == "failed": return err("Work item has failed", 409)
+        if row["status"] == "blocked":
+            # Check if deps are done
+            deps = json.loads(row["deps_json"])
+            for dep in deps:
+                dep_row = db.execute("SELECT status FROM work_items WHERE work_id=?", (dep,)).fetchone()
+                if not dep_row or dep_row["status"] != "done":
+                    return err(f"Dependency {dep} is not done yet", 409)
+            # All deps done — unblock
+            db.execute("UPDATE work_items SET status='ready' WHERE work_id=?", (work_id,))
+            db.commit()
+        lid        = str(uuid.uuid4())
+        expires_ts = datetime.fromtimestamp(time.time() + duration, tz=timezone.utc).isoformat()
+        ev = new_event(principal, "work_claimed", {"work_id": work_id, "lease_id": lid, "lease_expires": expires_ts})
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+        db.execute("UPDATE work_items SET status='leased', lease_id=?, lease_holder=?, lease_expires=? WHERE work_id=?",
+                   (lid, principal, expires_ts, work_id))
+        db.commit()
+    return ok({"ok": True, "lease_id": lid, "lease_expires": expires_ts, "seq": seq}, 201)
 
-        if name == "read_events":
-            after  = max(0, int(args.get("after_cursor", 0)))
-            events = read_events_since(after)
-            cursor = events[-1]["seq"] if events else after
-            text   = f"SPHERA room — {len(events)} event(s), cursor: {cursor}\n\n"
-            text  += "\n─────\n".join(fmt_event(e) for e in events) if events else f"No events after {after}."
-            return mcp_ok(id_, {"content": [{"type": "text", "text": text}]})
+@app.post("/work/{work_id}/heartbeat")
+async def heartbeat(work_id: str, request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    body      = await request.json()
+    lease_id  = body.get("lease_id")
+    extension = min(int(body.get("extend_seconds", 60)), MAX_LEASE)
+    with get_db() as db:
+        row = db.execute("SELECT * FROM work_items WHERE work_id=?", (work_id,)).fetchone()
+        if not row:                    return err("Work item not found", 404)
+        if row["status"] != "leased":  return err("Work item is not leased", 409)
+        if row["lease_id"] != lease_id: return err("Lease ID mismatch", 403)
+        if row["lease_holder"] != principal: return err("Not your lease", 403)
+        new_exp = datetime.fromtimestamp(time.time() + extension, tz=timezone.utc).isoformat()
+        ev = new_event(principal, "work_heartbeat", {"work_id": work_id, "lease_id": lease_id, "new_expiry": new_exp})
+        append_event(db, ev)
+        db.execute("UPDATE work_items SET lease_expires=? WHERE work_id=?", (new_exp, work_id))
+        db.commit()
+    return ok({"ok": True, "new_expiry": new_exp}, 200)
 
-        if name == "post_message":
-            content = (args.get("content") or "").strip()
-            if not content:
-                return mcp_err(id_, -32602, '"content" must be non-empty')
-            event = append_event(principal, "message", {"content": content})
-            return mcp_ok(id_, {"content": [{"type": "text",
-                "text": f"Posted. seq: {event['seq']}, id: {event['id']}, principal: {principal}"}]})
+@app.post("/work/{work_id}/result")
+async def submit_result(work_id: str, request: Request, authorization: str = Header(default="")):
+    principal = get_principal(authorization)
+    body      = await request.json()
+    lease_id  = body.get("lease_id")
+    result    = body.get("result")
+    if not lease_id: return err('"lease_id" required')
+    if result is None: return err('"result" required')
+    with get_db() as db:
+        row = db.execute("SELECT * FROM work_items WHERE work_id=?", (work_id,)).fetchone()
+        if not row:                     return err("Not found", 404)
+        if row["lease_id"] != lease_id:  return err("Stale lease — lease ID mismatch", 403)
+        if row["lease_holder"] != principal: return err("Not your lease", 403)
+        if row["status"] != "leased":    return err("Work item is not leased", 409)
+        if row["lease_expires"] and utcnow() > row["lease_expires"]:
+            return err("Lease has expired", 403)
+        ev = new_event(principal, "work_result", {"work_id": work_id, "lease_id": lease_id, "result": result})
+        append_event(db, ev)
+        seq = db.execute("SELECT seq FROM events WHERE id=?", (ev["id"],)).fetchone()["seq"]
+        db.execute("UPDATE work_items SET status='done', result_seq=?, lease_id=NULL, lease_holder=NULL WHERE work_id=?", (seq, work_id))
+        db.commit()
+        # Unblock dependents
+        deps_on_this = db.execute("SELECT work_id, deps_json FROM work_items WHERE status='blocked'").fetchall()
+        for dep in deps_on_this:
+            deps = json.loads(dep["deps_json"])
+            if work_id in deps:
+                all_done = all(
+                    db.execute("SELECT status FROM work_items WHERE work_id=?", (d,)).fetchone()["status"] == "done"
+                    for d in deps
+                )
+                if all_done:
+                    db.execute("UPDATE work_items SET status='ready' WHERE work_id=?", (dep["work_id"],))
+                    ev2 = new_event("system", "work_item_unblocked", {"work_id": dep["work_id"]})
+                    append_event(db, ev2)
+        db.commit()
+    return ok({"ok": True, "seq": seq}, 201)
 
-        return mcp_err(id_, -32601, f"Unknown tool: {name}")
-
-    return mcp_err(id_, -32601, f"Method not found: {method}")
-
-def fmt_event(e):
-    h = f"[seq:{e['seq']}] [{e['timestamp']}] [{e['principal']}] [{e['type']}]"
-    if e["type"] == "message":            return f"{h}\n{e['content']}"
-    if e["type"] == "artifact_intent":    return f"{h}\npath: {e.get('path')}"
-    if e["type"] == "artifact_committed": return f"{h}\npath: {e.get('path')} sha: {e.get('sha')}"
-    if e["type"] == "artifact_failed":    return f"{h}\npath: {e.get('path')} error: {e.get('error')}"
-    return f"{h}\n{json.dumps(e)}"
-
-def mcp_ok(id_, result):
-    return JSONResponse({"jsonrpc": "2.0", "id": id_, "result": result})
-
-def mcp_err(id_, code, message):
-    return JSONResponse({"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}})
-
-# ── Run ───────────────────────────────────────────────────────────────────────
+@app.get("/missions/{mission_id}/next")
+async def next_action(mission_id: str, authorization: str = Header(default="")):
+    get_principal(authorization)
+    with get_db() as db:
+        mission = db.execute("SELECT * FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+        if not mission: return err("Mission not found", 404)
+        items   = db.execute("SELECT * FROM work_items WHERE mission_id=?", (mission_id,)).fetchall()
+        ready   = [{"work_id": i["work_id"], "description": i["description"], "capability": i["capability"]} for i in items if i["status"] == "ready"]
+        blocked = [{"work_id": i["work_id"], "description": i["description"], "waiting_on": json.loads(i["deps_json"])} for i in items if i["status"] == "blocked"]
+        leased  = [{"work_id": i["work_id"], "holder": i["lease_holder"], "expires": i["lease_expires"]} for i in items if i["status"] == "leased"]
+        done    = [i["work_id"] for i in items if i["status"] == "done"]
+        all_done = len(done) == len(items) and len(items) > 0
+        # Check completion policy
+        status = "complete" if all_done else "in_progress"
+        return ok({"mission_id": mission_id, "objective": mission["objective"], "status": status,
+                   "ready": ready, "blocked": blocked, "leased": leased, "done_count": len(done),
+                   "total": len(items)})
 
 if __name__ == "__main__":
-    init_db()
-    print(f"SPHERA Local Server starting on http://localhost:{PORT}")
-    print(f"Ledger: {DB_PATH.absolute()}")
-    print(f"MCP endpoint: http://localhost:{PORT}/mcp")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="warning")
