@@ -360,3 +360,95 @@ async def room_state(authorization: str = Header(default="")):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
+
+# ── Agent self-assignment (capability-driven auto-claim) ──────────────────────
+@app.post("/work/{wid}/auto-claim")
+async def auto_claim_work(wid: str, req: Request, authorization: str = Header(default="")):
+    """Agent announces it's ready. Server finds and assigns best-matched available work."""
+    p = auth(authorization)
+    b = await req.json()
+    agent_id = b.get("agent_id")
+    if not agent_id:
+        return err("agent_id required")
+    
+    with get_db() as db:
+        agent = db.execute("SELECT * FROM agents WHERE agent_id=? AND status='available'", (agent_id,)).fetchone()
+        if not agent: return err("agent not found or not available", 404)
+        
+        # Check this agent is registered by this principal
+        if agent["registered_by"] != p: raise HTTPException(403, "not your agent")
+        
+        caps = json.loads(agent["capabilities"])
+        
+        # Find ready work items this agent can handle (best capability match)
+        ready = db.execute("SELECT * FROM work_items WHERE status='ready'").fetchall()
+        candidates = []
+        for w in ready:
+            if w["capability"] in caps:
+                # Score: specialist bonus
+                s = 110 if len(caps) == 1 else max(80 - (len(caps)-1)*2, 10)
+                candidates.append((dict(w), s))
+        
+        if not candidates:
+            return ok({"ok": False, "reason": "no matching work available", "agent_caps": caps})
+        
+        # Pick highest scored, then oldest
+        candidates.sort(key=lambda x: (-x[1], x[0].get('created_at','')))
+        best_work = candidates[0][0]
+        
+        # Atomic claim
+        lid = uid()
+        exp = (now() + timedelta(seconds=60)).isoformat()
+        cur = db.execute(
+            "UPDATE work_items SET status='leased',assigned_to=?,lease_id=?,lease_expires=? WHERE work_id=? AND status='ready'",
+            (agent_id, lid, exp, best_work["work_id"])
+        )
+        if cur.rowcount != 1:
+            db.rollback()
+            return err("race: work item claimed by another agent", 409)
+        
+        db.execute("UPDATE agents SET status='busy',current_work_id=?,lease_id=?,lease_expires=? WHERE agent_id=?",
+                   (best_work["work_id"], lid, exp, agent_id))
+        seq = emit(db, p, "work_auto_claimed",
+                   {"work_id": best_work["work_id"], "agent_id": agent_id,
+                    "capability": best_work["capability"], "lease_id": lid})
+        db.commit()
+    
+    await broadcast({"type":"work_auto_claimed","work_id":best_work["work_id"],
+                     "agent_id":agent_id,"description":best_work["description"],"seq":seq})
+    
+    return ok({"ok": True, "work_id": best_work["work_id"],
+               "description": best_work["description"],
+               "capability": best_work["capability"],
+               "lease_id": lid, "lease_expires": exp, "seq": seq}, 201)
+
+@app.get("/work/queue")
+async def work_queue(authorization: str = Header(default="")):
+    """Full work queue view: ready, leased, blocked, done per mission."""
+    auth(authorization)
+    with get_db() as db:
+        missions = db.execute("SELECT * FROM missions WHERE status='active'").fetchall()
+        result = []
+        for m in missions:
+            items = db.execute("SELECT * FROM work_items WHERE mission_id=? ORDER BY created_at", (m["mission_id"],)).fetchall()
+            agents = db.execute("SELECT * FROM agents").fetchall()
+            ready_items = [dict(i) for i in items if i["status"]=="ready"]
+            # For each ready item, show best available agent
+            for item in ready_items:
+                avail = [dict(a) for a in agents if a["status"]=="available"]
+                avail_with_caps = [{**a, "capabilities": json.loads(a["capabilities"])} for a in avail]
+                candidates = [(a,110 if len(a["capabilities"])==1 else max(80-(len(a["capabilities"])-1)*2,10))
+                              for a in avail_with_caps if item["capability"] in a["capabilities"]]
+                candidates.sort(key=lambda x: -x[1])
+                item["best_agent"] = candidates[0][0]["name"] if candidates else None
+                item["agent_score"] = candidates[0][1] if candidates else None
+            result.append({
+                "mission_id": m["mission_id"],
+                "objective": m["objective"],
+                "ready": ready_items,
+                "leased": [dict(i) for i in items if i["status"]=="leased"],
+                "blocked": [dict(i) for i in items if i["status"]=="blocked"],
+                "done_count": sum(1 for i in items if i["status"]=="done"),
+                "total": len(items)
+            })
+    return ok({"queue": result, "ts": now_iso()})
