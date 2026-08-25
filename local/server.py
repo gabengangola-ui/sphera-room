@@ -455,3 +455,48 @@ async def work_queue(authorization: str = Header(default="")):
 if __name__ == "__main__":
     # All routes declared above - safe to start server now
     uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
+
+# ── Auto-decompose endpoint ───────────────────────────────────────────────────
+@app.post("/mission/{mid}/decompose")
+async def auto_decompose(mid: str, authorization: str = Header(default="")):
+    """
+    Decompose mission objective into work items via rule-based decomposer.
+    Writes directly to DB — no self-HTTP-call, no port dependency.
+    Only mission owner may decompose. Idempotent check: fails if items already exist.
+    """
+    p = auth(authorization)
+    from decomposer import decompose
+
+    with get_db() as db:
+        mission = db.execute("SELECT * FROM missions WHERE mission_id=?", (mid,)).fetchone()
+        if not mission: return err("mission not found", 404)
+        if mission["owner"] != p: raise HTTPException(403, "owner only")
+        existing = db.execute("SELECT COUNT(*) FROM work_items WHERE mission_id=?", (mid,)).fetchone()[0]
+        if existing > 0:
+            return err(f"mission already has {existing} work item(s). Use manual work creation to add more.", 409)
+
+        plan    = decompose(mission["objective"])
+        created = []
+        wids    = []
+
+        for item in plan:
+            deps   = [wids[i] for i in item['dep_indices'] if i < len(wids)]
+            wid    = uid()
+            status = "blocked" if deps else "ready"
+            seq    = emit(db, p, "work_created", {
+                "work_id": wid, "mission_id": mid,
+                "description": item['description'],
+                "capability": item['capability'],
+                "deps": deps, "status": status
+            })
+            db.execute("INSERT INTO work_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (wid, mid, item['description'], item['capability'],
+                        json.dumps(deps), status, None, None, None, None, None, now_iso(), seq))
+            wids.append(wid)
+            created.append({"work_id": wid, "description": item['description'],
+                            "capability": item['capability'], "status": status})
+        db.commit()
+
+    await broadcast({"type": "mission_decomposed", "mission_id": mid,
+                     "objective": mission["objective"], "work_count": len(created)})
+    return ok({"ok": True, "mission_id": mid, "work_items": created, "count": len(created)}, 201)
