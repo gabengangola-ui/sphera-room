@@ -1,223 +1,26 @@
 """
-SPHERA Local Server v0.2
-Fixes from Soba's NOT PASS review:
-1. Atomic claim via UPDATE WHERE status='ready' + rowcount check
-2. Heartbeat rejects expired leases (no resurrection)
-3. Lease duration clamped: 1 <= seconds <= MAX_LEASE
-4. Dependency integrity: exists, same mission, no self-dep, cycle detection
-5. Mission authority: only owner can add work items
-6. Decision claim expiry/recovery: claimed_at + claim_expires, lazy recovery
-7. Time comparison: aware datetime objects, not ISO string comparison
-8. Auth: startup fails if required env vars absent
-+ Mission acceptance gate
+SPHERA Server v1.0
+Full platform: messages, missions, work, agents, decisions, room events.
 """
-
-import hashlib, json, os, sqlite3, uuid
+import json, os, sys
+sys.path.insert(0, "/home/claude/sphera")
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from db import get_db, init
+from core import *
 
-MAX_LEASE        = 300   # seconds
-CLAIM_LEASE_SECS = 120   # decision claim expires after this if not consumed/failed
+# ── Auth ──────────────────────────────────────────────────────────────────────
+KEYS: dict = {}
 
-# 8. Auth: fail on startup if keys absent
-def _require_env(name):
-    v = os.environ.get(name, "")
-    if not v:
-        raise RuntimeError(f"Required env var {name} is not set. Refusing to start with predictable credentials.")
+def _need(name):
+    v = os.environ.get(name,"")
+    if not v: raise RuntimeError(f"Missing required env var: {name}")
     return v
 
-KEYS: dict = {}  # populated in lifespan
-
-DB_PATH = os.environ.get("SPHERA_DB", "/home/claude/sphera-local/sphera.db")
-
-# ── Time helpers ──────────────────────────────────────────────────────────────
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-def utcnow_iso() -> str:
-    return utcnow().isoformat()
-
-def parse_dt(s: Optional[str]) -> Optional[datetime]:
-    """Parse ISO timestamp to aware UTC datetime. Returns None if s is None."""
-    if s is None:
-        return None
-    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        raise ValueError(f"Naive datetime rejected: {s}. Supply UTC offset.")
-    return dt.astimezone(timezone.utc)
-
-def is_expired(expires_iso: Optional[str]) -> bool:
-    if expires_iso is None:
-        return False
-    return utcnow() > parse_dt(expires_iso)
-
-# ── Database ──────────────────────────────────────────────────────────────────
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-def init_db():
-    with get_db() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS events (
-            seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-            id        TEXT UNIQUE NOT NULL,
-            ts        TEXT NOT NULL,
-            principal TEXT NOT NULL,
-            type      TEXT NOT NULL,
-            payload   TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS decision_state (
-            request_id           TEXT PRIMARY KEY,
-            status               TEXT NOT NULL,
-            requesting_principal TEXT NOT NULL,
-            scope                TEXT NOT NULL,
-            target               TEXT NOT NULL,
-            params_json          TEXT NOT NULL,
-            bound_digest         TEXT NOT NULL,
-            deadline             TEXT,
-            claimed_at           TEXT,
-            claim_expires        TEXT
-        );
-        CREATE TABLE IF NOT EXISTS missions (
-            mission_id   TEXT PRIMARY KEY,
-            objective    TEXT NOT NULL,
-            owner        TEXT NOT NULL,
-            status       TEXT NOT NULL DEFAULT 'active',
-            policy_json  TEXT,
-            created_at   TEXT NOT NULL,
-            accepted_at  TEXT,
-            acceptance_note TEXT,
-            seq          INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS work_items (
-            work_id       TEXT PRIMARY KEY,
-            mission_id    TEXT NOT NULL,
-            description   TEXT NOT NULL,
-            capability    TEXT NOT NULL,
-            deps_json     TEXT NOT NULL DEFAULT '[]',
-            status        TEXT NOT NULL DEFAULT 'ready',
-            lease_id      TEXT,
-            lease_holder  TEXT,
-            lease_expires TEXT,
-            result_seq    INTEGER,
-            seq           INTEGER
-        );
-        """)
-    recover_on_startup()
-
-def recover_on_startup():
-    now_iso = utcnow_iso()
-    with get_db() as db:
-        # Recover stale work leases
-        stale_work = db.execute(
-            "SELECT work_id, lease_id FROM work_items WHERE status='leased' AND lease_expires < ?", (now_iso,)
-        ).fetchall()
-        for row in stale_work:
-            _emit_event(db, "system", "work_lease_expired",
-                        {"work_id": row["work_id"], "lease_id": row["lease_id"], "reason": "server_restart"})
-            db.execute("UPDATE work_items SET status='ready', lease_id=NULL, lease_holder=NULL, lease_expires=NULL WHERE work_id=?",
-                       (row["work_id"],))
-        # Recover stale decision claims
-        stale_claims = db.execute(
-            "SELECT request_id FROM decision_state WHERE status='claimed' AND claim_expires < ?", (now_iso,)
-        ).fetchall()
-        for row in stale_claims:
-            _emit_event(db, "system", "decision_claim_expired",
-                        {"request_id": row["request_id"], "reason": "server_restart"})
-            db.execute("UPDATE decision_state SET status='approved', claimed_at=NULL, claim_expires=NULL WHERE request_id=?",
-                       (row["request_id"],))
-        if stale_work or stale_claims:
-            db.commit()
-
-# ── Event helpers ─────────────────────────────────────────────────────────────
-def _emit_event(db, principal, type_, payload):
-    eid = str(uuid.uuid4())
-    db.execute("INSERT INTO events (id,ts,principal,type,payload) VALUES (?,?,?,?,?)",
-               (eid, utcnow_iso(), principal, type_, json.dumps(payload)))
-    return db.execute("SELECT seq FROM events WHERE id=?", (eid,)).fetchone()["seq"]
-
-def canonical_json(obj):
-    if isinstance(obj, dict):
-        return "{" + ",".join(f"{json.dumps(k)}:{canonical_json(obj[k])}" for k in sorted(obj.keys())) + "}"
-    if isinstance(obj, list):
-        return "[" + ",".join(canonical_json(i) for i in obj) + "]"
-    return json.dumps(obj)
-
-def sha256(s):
-    return hashlib.sha256(s.encode()).hexdigest()
-
-def compute_digest(scope, target, principal, params):
-    action = {"params": params, "principal": principal, "scope": scope, "target": target}
-    return sha256(canonical_json(action))
-
-# ── Cycle detection ───────────────────────────────────────────────────────────
-def has_cycle(db, mission_id: str, new_work_id: str, new_deps: list) -> bool:
-    """DFS from new_work_id following deps — cycle if we reach new_work_id again."""
-    all_items = db.execute("SELECT work_id, deps_json FROM work_items WHERE mission_id=?", (mission_id,)).fetchall()
-    graph = {r["work_id"]: json.loads(r["deps_json"]) for r in all_items}
-    graph[new_work_id] = new_deps
-
-    visited = set()
-    def dfs(node):
-        if node == new_work_id and node in visited:
-            return True
-        if node in visited:
-            return False
-        visited.add(node)
-        for dep in graph.get(node, []):
-            if dfs(dep):
-                return True
-        visited.discard(node)
-        return False
-
-    visited.add(new_work_id)
-    for dep in new_deps:
-        if dep == new_work_id:
-            return True
-        if dfs(dep):
-            return True
-    return False
-
-# ── Lazy decision claim recovery ──────────────────────────────────────────────
-def recover_decision_claim_if_expired(db, request_id: str) -> bool:
-    """Returns True if claim was expired and recovered."""
-    row = db.execute("SELECT status, claim_expires FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
-    if not row or row["status"] != "claimed":
-        return False
-    if row["claim_expires"] and is_expired(row["claim_expires"]):
-        _emit_event(db, "system", "decision_claim_expired", {"request_id": request_id, "reason": "lazy_recovery"})
-        db.execute("UPDATE decision_state SET status='approved', claimed_at=NULL, claim_expires=NULL WHERE request_id=?",
-                   (request_id,))
-        db.commit()
-        return True
-    return False
-
-# ── App ───────────────────────────────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global KEYS
-    KEYS = {
-        _require_env("CLAUDE_KEY"):  "claude",
-        _require_env("SOBA_KEY"):    "soba",
-        _require_env("ARCIDES_KEY"): "arcides",
-    }
-    init_db()
-    yield
-
-app = FastAPI(title="SPHERA Local v0.2", lifespan=lifespan)
-
-def _ok(data, status=200): return JSONResponse(content=data, status_code=status)
-def _err(msg, status=400): return JSONResponse(content={"error": msg}, status_code=status)
-
-def _auth(authorization: str) -> str:
+def auth(authorization: str = "") -> str:
     if not authorization.startswith("Bearer "):
         raise HTTPException(401, "Unauthorized")
     token = authorization[7:].strip()
@@ -225,397 +28,335 @@ def _auth(authorization: str) -> str:
         raise HTTPException(401, "Unauthorized")
     return KEYS[token]
 
+def arcides_only(p):
+    if p != "arcides": raise HTTPException(403, "arcides only")
+
+# ── WebSocket room ─────────────────────────────────────────────────────────────
+connected: list = []
+
+async def broadcast(event: dict):
+    dead = []
+    for ws in connected:
+        try: await ws.send_json(event)
+        except: dead.append(ws)
+    for ws in dead: connected.remove(ws)
+
+# ── App ───────────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global KEYS
+    KEYS = {_need("CLAUDE_KEY"):"claude", _need("SOBA_KEY"):"soba", _need("ARCIDES_KEY"):"arcides"}
+    init()
+    with get_db() as db:
+        n = recover(db)
+        if n: print(f"[startup] recovered {n} stale leases")
+    print("[sphera] ready on :8765")
+    yield
+
+app = FastAPI(title="SPHERA", version="1.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+def ok(d, s=200): return JSONResponse(d, s)
+def err(m, s=400): return JSONResponse({"error":m}, s)
+
+# ── WebSocket ─────────────────────────────────────────────────────────────────
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    connected.append(ws)
+    try:
+        # Send history on connect
+        with get_db() as db:
+            rows = db.execute("SELECT * FROM events ORDER BY seq DESC LIMIT 100").fetchall()
+        await ws.send_json({"type":"history","events":[dict(r) for r in reversed(rows)]})
+        while True:
+            await ws.receive_text()  # keep alive
+    except WebSocketDisconnect:
+        if ws in connected: connected.remove(ws)
+
 # ── Messages ──────────────────────────────────────────────────────────────────
 @app.post("/message")
-async def post_message(request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    body = await request.json()
-    content = (body.get("content") or "").strip()
-    if not content:
-        return _err("content required")
-    try:
-        parsed = json.loads(content)
-        if isinstance(parsed, dict) and str(parsed.get("type", "")).startswith("decision_"):
-            return _err("Decision events must use /decision endpoints", 400)
-    except Exception:
-        pass
+async def post_message(req: Request, authorization: str = Header(default="")):
+    p = auth(authorization)
+    b = await req.json()
+    content = (b.get("content") or "").strip()
+    if not content: return err("content required")
     with get_db() as db:
-        seq = _emit_event(db, principal, "message", {"content": content})
+        seq = emit(db, p, "message", {"content": content})
         db.commit()
-    return _ok({"ok": True, "seq": seq}, 201)
+        ev = {"seq":seq,"principal":p,"type":"message","content":content,"ts":now_iso()}
+    await broadcast(ev)
+    return ok({"ok":True,"seq":seq}, 201)
 
 @app.get("/events")
-async def read_events(after: int = 0, authorization: str = Header(default="")):
-    _auth(authorization)
+async def get_events(after: int = 0, authorization: str = Header(default="")):
+    auth(authorization)
     with get_db() as db:
-        rows = db.execute("SELECT * FROM events WHERE seq > ? ORDER BY seq", (after,)).fetchall()
-    events = [{"seq": r["seq"], "id": r["id"], "timestamp": r["ts"],
-               "principal": r["principal"], "type": r["type"], **json.loads(r["payload"])} for r in rows]
-    cursor = events[-1]["seq"] if events else after
-    return _ok({"events": events, "count": len(events), "cursor": cursor})
-
-# ── Decisions ─────────────────────────────────────────────────────────────────
-@app.post("/decision")
-async def decision_request(request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    body = await request.json()
-    scope  = body.get("scope")
-    target = body.get("target")
-    params = body.get("params")
-    if not scope  or not isinstance(scope, str):  return _err('"scope" required')
-    if not target or not isinstance(target, str): return _err('"target" required')
-    if not isinstance(params, dict):              return _err('"params" must be an object')
-    deadline = body.get("deadline")
-    if deadline:
-        try:
-            parse_dt(deadline)
-        except Exception:
-            return _err('"deadline" must be a valid UTC ISO timestamp')
-
-    digest     = compute_digest(scope, target, principal, params)
-    request_id = str(uuid.uuid4())
-    with get_db() as db:
-        seq = _emit_event(db, principal, "decision_requested",
-                          {"request_id": request_id, "scope": scope, "target": target,
-                           "params": params, "payload_digest": digest, "deadline": deadline})
-        db.execute("INSERT INTO decision_state VALUES (?,?,?,?,?,?,?,?,?,?)",
-                   (request_id, "pending", principal, scope, target, json.dumps(params), digest, deadline, None, None))
-        db.commit()
-    return _ok({"ok": True, "request_id": request_id, "seq": seq, "payload_digest": digest}, 201)
-
-@app.post("/decision/{request_id}/approve")
-async def decision_approve(request_id: str, request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    if principal != "arcides":
-        raise HTTPException(403, "Only arcides may approve")
-    body = await request.json()
-    with get_db() as db:
-        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
-        if not row:                   return _err("Not found", 404)
-        if row["status"] != "pending": return _err(f"Cannot approve: status is '{row['status']}'", 409)
-        if row["deadline"] and is_expired(row["deadline"]):
-            _emit_event(db, "system", "decision_expired", {"request_id": request_id})
-            db.execute("UPDATE decision_state SET status='expired' WHERE request_id=?", (request_id,))
-            db.commit()
-            return _err("Decision has expired", 410)
-        seq = _emit_event(db, principal, "decision_approved",
-                          {"request_id": request_id, "bound_digest": row["bound_digest"], "note": body.get("note")})
-        db.execute("UPDATE decision_state SET status='approved' WHERE request_id=?", (request_id,))
-        db.commit()
-    return _ok({"ok": True, "seq": seq, "request_id": request_id}, 201)
-
-@app.post("/decision/{request_id}/reject")
-async def decision_reject(request_id: str, request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    if principal != "arcides":
-        raise HTTPException(403, "Only arcides may reject")
-    body = await request.json()
-    with get_db() as db:
-        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
-        if not row:                   return _err("Not found", 404)
-        if row["status"] != "pending": return _err(f"Cannot reject: status is '{row['status']}'", 409)
-        seq = _emit_event(db, principal, "decision_rejected",
-                          {"request_id": request_id, "reason": body.get("reason")})
-        db.execute("UPDATE decision_state SET status='rejected' WHERE request_id=?", (request_id,))
-        db.commit()
-    return _ok({"ok": True, "seq": seq}, 201)
-
-@app.post("/decision/{request_id}/claim")
-async def decision_claim(request_id: str, request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    body   = await request.json()
-    params = body.get("params")
-    if not isinstance(params, dict): return _err('"params" required to verify digest')
-    with get_db() as db:
-        # Lazy claim recovery
-        recover_decision_claim_if_expired(db, request_id)
-        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
-        if not row:                    return _err("Not found", 404)
-        if row["status"] != "approved": return _err(f"Cannot claim: status is '{row['status']}'", 409)
-        if row["requesting_principal"] != principal:
-            raise HTTPException(403, "Only the requesting principal may claim")
-        if row["deadline"] and is_expired(row["deadline"]):
-            _emit_event(db, "system", "decision_expired", {"request_id": request_id})
-            db.execute("UPDATE decision_state SET status='expired' WHERE request_id=?", (request_id,))
-            db.commit()
-            return _err("Decision has expired", 410)
-        computed = compute_digest(row["scope"], row["target"], principal, params)
-        if computed != row["bound_digest"]:
-            return _err("Payload digest mismatch", 422)
-        now_iso      = utcnow_iso()
-        claim_exp    = (utcnow() + timedelta(seconds=CLAIM_LEASE_SECS)).isoformat()
-        seq = _emit_event(db, principal, "decision_claimed", {"request_id": request_id})
-        db.execute("UPDATE decision_state SET status='claimed', claimed_at=?, claim_expires=? WHERE request_id=?",
-                   (now_iso, claim_exp, request_id))
-        db.commit()
-    return _ok({"ok": True, "seq": seq, "claim_expires": claim_exp}, 201)
-
-@app.post("/decision/{request_id}/consume")
-async def decision_consume(request_id: str, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    with get_db() as db:
-        recover_decision_claim_if_expired(db, request_id)
-        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
-        if not row:                    return _err("Not found", 404)
-        if row["status"] != "claimed": return _err(f"Cannot consume: status is '{row['status']}'", 409)
-        if row["requesting_principal"] != principal: raise HTTPException(403, "Only requester may consume")
-        seq = _emit_event(db, principal, "decision_consumed", {"request_id": request_id})
-        db.execute("UPDATE decision_state SET status='consumed' WHERE request_id=?", (request_id,))
-        db.commit()
-    return _ok({"ok": True, "seq": seq}, 201)
-
-@app.post("/decision/{request_id}/fail")
-async def decision_fail(request_id: str, request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    body = await request.json()
-    with get_db() as db:
-        recover_decision_claim_if_expired(db, request_id)
-        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
-        if not row:                    return _err("Not found", 404)
-        if row["status"] != "claimed": return _err(f"Cannot fail: status is '{row['status']}'", 409)
-        if row["requesting_principal"] != principal: raise HTTPException(403, "Only requester may report failure")
-        seq = _emit_event(db, principal, "execution_failed",
-                          {"request_id": request_id, "reason": body.get("error", "unknown")})
-        db.execute("UPDATE decision_state SET status='approved', claimed_at=NULL, claim_expires=NULL WHERE request_id=?",
-                   (request_id,))
-        db.commit()
-    return _ok({"ok": True, "seq": seq, "status": "approved"}, 201)
-
-@app.get("/decision/{request_id}")
-async def get_decision(request_id: str, authorization: str = Header(default="")):
-    _auth(authorization)
-    with get_db() as db:
-        row = db.execute("SELECT * FROM decision_state WHERE request_id=?", (request_id,)).fetchone()
-        if not row: return _err("Not found", 404)
-        return _ok({"found": True, "request_id": request_id, "status": row["status"],
-                    "scope": row["scope"], "target": row["target"],
-                    "requesting_principal": row["requesting_principal"],
-                    "bound_digest": row["bound_digest"], "deadline": row["deadline"],
-                    "claim_expires": row["claim_expires"]})
+        rows = db.execute("SELECT * FROM events WHERE seq>? ORDER BY seq", (after,)).fetchall()
+    events = [{"seq":r["seq"],"id":r["id"],"ts":r["ts"],"principal":r["principal"],
+               "type":r["type"],**json.loads(r["payload"])} for r in rows]
+    return ok({"events":events,"count":len(events),"cursor":events[-1]["seq"] if events else after})
 
 # ── Missions ──────────────────────────────────────────────────────────────────
 @app.post("/mission")
-async def create_mission(request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    body      = await request.json()
-    objective = body.get("objective")
-    if not objective: return _err('"objective" required')
-    policy = body.get("acceptance_policy", {})
-    mid    = str(uuid.uuid4())
+async def create_mission(req: Request, authorization: str = Header(default="")):
+    p = auth(authorization)
+    b = await req.json()
+    if not b.get("objective"): return err("objective required")
+    mid = uid()
     with get_db() as db:
-        seq = _emit_event(db, principal, "mission_created",
-                          {"mission_id": mid, "objective": objective, "owner": principal, "policy": policy})
-        db.execute("INSERT INTO missions VALUES (?,?,?,?,?,?,?,?,?)",
-                   (mid, objective, principal, "active", json.dumps(policy), utcnow_iso(), None, None, seq))
+        seq = emit(db, p, "mission_created", {"mission_id":mid,"objective":b["objective"],"owner":p})
+        db.execute("INSERT INTO missions VALUES(?,?,?,?,?,?,?)", (mid,b["objective"],p,"active",now_iso(),None,seq))
         db.commit()
-    return _ok({"ok": True, "mission_id": mid, "seq": seq}, 201)
+    await broadcast({"type":"mission_created","mission_id":mid,"objective":b["objective"],"seq":seq})
+    return ok({"ok":True,"mission_id":mid,"seq":seq}, 201)
 
-@app.post("/mission/{mission_id}/work")
-async def create_work_item(mission_id: str, request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    body = await request.json()
-    desc = body.get("description")
-    cap  = body.get("capability")
-    deps = body.get("dependencies", [])
-    if not desc: return _err('"description" required')
-    if not cap:  return _err('"capability" required')
-    if not isinstance(deps, list): return _err('"dependencies" must be a list')
-
+@app.get("/missions")
+async def list_missions(authorization: str = Header(default="")):
+    auth(authorization)
     with get_db() as db:
-        mission = db.execute("SELECT owner FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
-        if not mission: return _err("Mission not found", 404)
-        # 5. Mission authority: only owner may add work
-        if mission["owner"] != principal:
-            raise HTTPException(403, f"Only mission owner '{mission['owner']}' may add work items")
+        missions = db.execute("SELECT * FROM missions ORDER BY created_at DESC").fetchall()
+        result = []
+        for m in missions:
+            items = db.execute("SELECT status FROM work_items WHERE mission_id=?", (m["mission_id"],)).fetchall()
+            done = sum(1 for i in items if i["status"]=="done")
+            result.append({**dict(m),"work_count":len(items),"done_count":done})
+    return ok({"missions":result})
 
-        wid = str(uuid.uuid4())
-        # 4. Dependency integrity
-        for dep in deps:
-            if dep == wid: return _err("Self-dependency not allowed", 400)
-            dep_row = db.execute("SELECT mission_id FROM work_items WHERE work_id=?", (dep,)).fetchone()
-            if not dep_row:                        return _err(f"Dependency '{dep}' not found", 400)
-            if dep_row["mission_id"] != mission_id: return _err(f"Dependency '{dep}' belongs to a different mission", 400)
-        if deps and has_cycle(db, mission_id, wid, deps):
-            return _err("Dependency cycle detected", 400)
-
+@app.post("/mission/{mid}/work")
+async def add_work(mid: str, req: Request, authorization: str = Header(default="")):
+    p = auth(authorization)
+    b = await req.json()
+    if not b.get("description"): return err("description required")
+    if not b.get("capability"):  return err("capability required")
+    with get_db() as db:
+        m = db.execute("SELECT owner FROM missions WHERE mission_id=?", (mid,)).fetchone()
+        if not m: return err("mission not found", 404)
+        if m["owner"] != p: raise HTTPException(403, "owner only")
+        deps = b.get("dependencies", [])
+        for d in deps:
+            if not db.execute("SELECT 1 FROM work_items WHERE work_id=? AND mission_id=?", (d,mid)).fetchone():
+                return err(f"dep {d} not found in this mission")
+        wid = uid()
         status = "blocked" if deps else "ready"
-        seq    = _emit_event(db, principal, "work_item_created",
-                             {"work_id": wid, "mission_id": mission_id, "description": desc,
-                              "capability": cap, "dependencies": deps, "status": status})
-        db.execute("INSERT INTO work_items VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                   (wid, mission_id, desc, cap, json.dumps(deps), status, None, None, None, None, seq))
+        seq = emit(db, p, "work_created", {"work_id":wid,"mission_id":mid,"description":b["description"],"capability":b["capability"],"deps":deps,"status":status})
+        db.execute("INSERT INTO work_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (wid,mid,b["description"],b["capability"],json.dumps(deps),status,None,None,None,None,None,now_iso(),seq))
         db.commit()
-    return _ok({"ok": True, "work_id": wid, "status": status, "seq": seq}, 201)
+    await broadcast({"type":"work_created","work_id":wid,"description":b["description"],"capability":b["capability"],"status":status,"seq":seq})
+    return ok({"ok":True,"work_id":wid,"status":status,"seq":seq}, 201)
 
-@app.post("/work/{work_id}/claim")
-async def claim_work(work_id: str, request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    body = await request.json()
-    # 3. Clamp lease duration
-    try:
-        raw_secs = int(body.get("lease_seconds", 60))
-    except (TypeError, ValueError):
-        return _err('"lease_seconds" must be an integer', 400)
-    if raw_secs < 1 or raw_secs > MAX_LEASE:
-        return _err(f'"lease_seconds" must be between 1 and {MAX_LEASE}', 400)
-
-    lid     = str(uuid.uuid4())
-    expires = (utcnow() + timedelta(seconds=raw_secs)).isoformat()
-
+@app.get("/mission/{mid}")
+async def get_mission(mid: str, authorization: str = Header(default="")):
+    auth(authorization)
     with get_db() as db:
-        # 1. ATOMIC CLAIM via conditional UPDATE + rowcount check
-        # First expire stale lease if any
-        stale = db.execute(
-            "SELECT lease_id FROM work_items WHERE work_id=? AND status='leased' AND lease_expires < ?",
-            (work_id, utcnow_iso())
-        ).fetchone()
+        m = db.execute("SELECT * FROM missions WHERE mission_id=?", (mid,)).fetchone()
+        if not m: return err("not found", 404)
+        items = db.execute("SELECT * FROM work_items WHERE mission_id=? ORDER BY created_at", (mid,)).fetchall()
+        ready   = [dict(i) for i in items if i["status"]=="ready"]
+        blocked = [dict(i) for i in items if i["status"]=="blocked"]
+        leased  = [dict(i) for i in items if i["status"]=="leased"]
+        done    = [dict(i) for i in items if i["status"]=="done"]
+        agents_avail = db.execute("SELECT * FROM agents WHERE status='available'").fetchall()
+    return ok({"mission":dict(m),"ready":ready,"blocked":blocked,"leased":leased,"done":done,
+               "total":len(items),"available_agents":len(agents_avail)})
+
+# ── Agents ────────────────────────────────────────────────────────────────────
+@app.post("/agent/register")
+async def register_agent(req: Request, authorization: str = Header(default="")):
+    p = auth(authorization)
+    b = await req.json()
+    if not b.get("name"): return err("name required")
+    caps = b.get("capabilities", [])
+    if not isinstance(caps, list) or not caps: return err("capabilities must be a non-empty list")
+    aid = uid()
+    with get_db() as db:
+        seq = emit(db, p, "agent_registered", {"agent_id":aid,"name":b["name"],"capabilities":caps,"registered_by":p})
+        db.execute("INSERT INTO agents VALUES(?,?,?,?,?,?,?,?,?)",
+                   (aid, b["name"], json.dumps(caps), p, "available", None, None, None, now_iso()))
+        db.commit()
+    await broadcast({"type":"agent_registered","agent_id":aid,"name":b["name"],"capabilities":caps,"seq":seq})
+    return ok({"ok":True,"agent_id":aid,"seq":seq}, 201)
+
+@app.get("/agents")
+async def list_agents(authorization: str = Header(default="")):
+    auth(authorization)
+    with get_db() as db:
+        agents = db.execute("SELECT * FROM agents ORDER BY registered_at").fetchall()
+    return ok({"agents":[{**dict(a),"capabilities":json.loads(a["capabilities"])} for a in agents]})
+
+@app.post("/work/{wid}/claim")
+async def claim_work(wid: str, req: Request, authorization: str = Header(default="")):
+    p = auth(authorization)
+    b = await req.json()
+    secs = max(1, min(int(b.get("lease_seconds", 60)), MAX_LEASE))
+    agent_id = b.get("agent_id")
+    lid = uid()
+    exp = (now() + timedelta(seconds=secs)).isoformat()
+    with get_db() as db:
+        # Lazy expire stale lease
+        stale = db.execute("SELECT lease_id FROM work_items WHERE work_id=? AND status='leased' AND lease_expires<?", (wid, now_iso())).fetchone()
         if stale:
-            _emit_event(db, "system", "work_lease_expired",
-                        {"work_id": work_id, "lease_id": stale["lease_id"], "reason": "lazy_expiry"})
-            db.execute("UPDATE work_items SET status='ready', lease_id=NULL, lease_holder=NULL, lease_expires=NULL WHERE work_id=?",
-                       (work_id,))
+            emit(db, "system", "lease_expired", {"work_id":wid,"lease_id":stale["lease_id"]})
+            db.execute("UPDATE work_items SET status='ready',assigned_to=NULL,lease_id=NULL,lease_expires=NULL WHERE work_id=?", (wid,))
             db.commit()
-
-        # Check blocked status and unblock if deps done
-        row = db.execute("SELECT * FROM work_items WHERE work_id=?", (work_id,)).fetchone()
-        if not row:               return _err("Work item not found", 404)
-        if row["status"] == "done":   return _err("Work item is already done", 409)
-        if row["status"] == "failed": return _err("Work item has failed", 409)
-        if row["status"] == "blocked":
-            deps = json.loads(row["deps_json"])
-            for dep in deps:
-                dep_row = db.execute("SELECT status FROM work_items WHERE work_id=?", (dep,)).fetchone()
-                if not dep_row or dep_row["status"] != "done":
-                    return _err(f"Dependency '{dep}' is not done", 409)
-            db.execute("UPDATE work_items SET status='ready' WHERE work_id=?", (work_id,))
-            db.commit()
-
-        # Atomic claim: UPDATE only if status='ready', check rowcount=1
-        cursor = db.execute(
-            "UPDATE work_items SET status='leased', lease_id=?, lease_holder=?, lease_expires=? WHERE work_id=? AND status='ready'",
-            (lid, principal, expires, work_id)
-        )
-        if cursor.rowcount != 1:
+        # Check capability match if agent specified
+        if agent_id:
+            agent = db.execute("SELECT * FROM agents WHERE agent_id=? AND status='available'", (agent_id,)).fetchone()
+            if not agent: return err("agent not available", 409)
+            work = db.execute("SELECT capability FROM work_items WHERE work_id=?", (wid,)).fetchone()
+            if work and json.loads(agent["capabilities"]) and work["capability"] not in json.loads(agent["capabilities"]):
+                return err(f"agent capability mismatch: needs '{work['capability']}'", 400)
+        cur = db.execute(
+            "UPDATE work_items SET status='leased',assigned_to=?,lease_id=?,lease_expires=? WHERE work_id=? AND status='ready'",
+            (agent_id or p, lid, exp, wid))
+        if cur.rowcount != 1:
             db.rollback()
-            return _err("Work item is not available to claim (concurrent claim or wrong status)", 409)
-        seq = _emit_event(db, principal, "work_claimed",
-                          {"work_id": work_id, "lease_id": lid, "lease_expires": expires})
+            return err("not available to claim", 409)
+        if agent_id:
+            db.execute("UPDATE agents SET status='busy',current_work_id=?,lease_id=?,lease_expires=? WHERE agent_id=?", (wid,lid,exp,agent_id))
+        seq = emit(db, p, "work_claimed", {"work_id":wid,"lease_id":lid,"lease_expires":exp,"claimed_by":agent_id or p})
         db.commit()
-    return _ok({"ok": True, "lease_id": lid, "lease_expires": expires, "seq": seq}, 201)
+    await broadcast({"type":"work_claimed","work_id":wid,"lease_id":lid,"claimed_by":agent_id or p,"seq":seq})
+    return ok({"ok":True,"lease_id":lid,"lease_expires":exp,"seq":seq}, 201)
 
-@app.post("/work/{work_id}/heartbeat")
-async def heartbeat(work_id: str, request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    body = await request.json()
-    lease_id = body.get("lease_id")
-    try:
-        extend = int(body.get("extend_seconds", 60))
-    except (TypeError, ValueError):
-        return _err('"extend_seconds" must be an integer', 400)
-    # 3. Clamp extension
-    if extend < 1 or extend > MAX_LEASE:
-        return _err(f'"extend_seconds" must be between 1 and {MAX_LEASE}', 400)
-
+@app.post("/work/{wid}/result")
+async def submit_result(wid: str, req: Request, authorization: str = Header(default="")):
+    p = auth(authorization)
+    b = await req.json()
+    lid = b.get("lease_id")
+    result = b.get("result")
+    if not lid:        return err("lease_id required")
+    if result is None: return err("result required")
     with get_db() as db:
-        row = db.execute("SELECT * FROM work_items WHERE work_id=?", (work_id,)).fetchone()
-        if not row:                    return _err("Not found", 404)
-        if row["status"] != "leased":  return _err("Not leased", 409)
-        if row["lease_id"] != lease_id: return _err("Lease ID mismatch", 403)
-        if row["lease_holder"] != principal: return _err("Not your lease", 403)
-        # 2. Heartbeat must not revive expired lease
-        if is_expired(row["lease_expires"]):
-            _emit_event(db, "system", "work_lease_expired",
-                        {"work_id": work_id, "lease_id": lease_id, "reason": "heartbeat_on_expired"})
-            db.execute("UPDATE work_items SET status='ready', lease_id=NULL, lease_holder=NULL, lease_expires=NULL WHERE work_id=?",
-                       (work_id,))
+        row = db.execute("SELECT * FROM work_items WHERE work_id=?", (wid,)).fetchone()
+        if not row:               return err("not found", 404)
+        if row["lease_id"] != lid: return err("stale lease", 403)
+        if row["status"] != "leased": return err("not leased", 409)
+        if expired(row["lease_expires"]): return err("lease expired", 403)
+        seq = emit(db, p, "work_result", {"work_id":wid,"lease_id":lid,"result":result})
+        db.execute("UPDATE work_items SET status='done',result=?,result_seq=?,assigned_to=NULL,lease_id=NULL,lease_expires=NULL WHERE work_id=?",
+                   (json.dumps(result), seq, wid))
+        # Free agent
+        agent = db.execute("SELECT agent_id FROM agents WHERE current_work_id=?", (wid,)).fetchone()
+        if agent:
+            db.execute("UPDATE agents SET status='available',current_work_id=NULL,lease_id=NULL,lease_expires=NULL WHERE agent_id=?", (agent["agent_id"],))
+        unblocked = unblock_dependents(db, wid)
+        db.commit()
+    await broadcast({"type":"work_result","work_id":wid,"result":result,"unblocked":unblocked,"seq":seq})
+    return ok({"ok":True,"seq":seq,"unblocked":unblocked}, 201)
+
+# ── Decisions ─────────────────────────────────────────────────────────────────
+@app.post("/decision")
+async def req_decision(req: Request, authorization: str = Header(default="")):
+    p = auth(authorization)
+    b = await req.json()
+    scope=b.get("scope"); target=b.get("target"); params=b.get("params",{})
+    if not scope:  return err("scope required")
+    if not target: return err("target required")
+    if not isinstance(params, dict): return err("params must be object")
+    dg = digest(scope, target, p, params)
+    rid = uid()
+    with get_db() as db:
+        seq = emit(db, p, "decision_requested", {"request_id":rid,"scope":scope,"target":target,"params":params,"digest":dg})
+        db.execute("INSERT INTO decisions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                   (rid,"pending",p,scope,target,json.dumps(params),dg,b.get("deadline"),None,None,seq))
+        db.commit()
+    await broadcast({"type":"decision_requested","request_id":rid,"scope":scope,"by":p,"seq":seq})
+    return ok({"ok":True,"request_id":rid,"seq":seq,"digest":dg}, 201)
+
+@app.post("/decision/{rid}/approve")
+async def approve_decision(rid: str, req: Request, authorization: str = Header(default="")):
+    p = auth(authorization); arcides_only(p)
+    b = await req.json()
+    with get_db() as db:
+        row = db.execute("SELECT * FROM decisions WHERE request_id=?", (rid,)).fetchone()
+        if not row:                  return err("not found", 404)
+        if row["status"]!="pending": return err(f"status is '{row['status']}'", 409)
+        seq = emit(db, p, "decision_approved", {"request_id":rid,"note":b.get("note")})
+        db.execute("UPDATE decisions SET status='approved' WHERE request_id=?", (rid,))
+        db.commit()
+    await broadcast({"type":"decision_approved","request_id":rid,"scope":row["scope"],"seq":seq})
+    return ok({"ok":True,"seq":seq}, 201)
+
+@app.post("/decision/{rid}/reject")
+async def reject_decision(rid: str, req: Request, authorization: str = Header(default="")):
+    p = auth(authorization); arcides_only(p)
+    b = await req.json()
+    with get_db() as db:
+        row = db.execute("SELECT * FROM decisions WHERE request_id=?", (rid,)).fetchone()
+        if not row:                  return err("not found", 404)
+        if row["status"]!="pending": return err(f"status is '{row['status']}'", 409)
+        seq = emit(db, p, "decision_rejected", {"request_id":rid,"reason":b.get("reason")})
+        db.execute("UPDATE decisions SET status='rejected' WHERE request_id=?", (rid,))
+        db.commit()
+    await broadcast({"type":"decision_rejected","request_id":rid,"seq":seq})
+    return ok({"ok":True,"seq":seq}, 201)
+
+@app.post("/decision/{rid}/claim")
+async def claim_decision(rid: str, req: Request, authorization: str = Header(default="")):
+    p = auth(authorization)
+    b = await req.json()
+    params = b.get("params")
+    if not isinstance(params, dict): return err("params required")
+    with get_db() as db:
+        row = db.execute("SELECT * FROM decisions WHERE request_id=?", (rid,)).fetchone()
+        if not row: return err("not found", 404)
+        if row["status"]=="claimed" and expired(row["claim_expires"]):
+            emit(db, "system", "decision_claim_expired", {"request_id":rid})
+            db.execute("UPDATE decisions SET status='approved',claimed_at=NULL,claim_expires=NULL WHERE request_id=?", (rid,))
             db.commit()
-            return _err("Lease has already expired — cannot renew", 410)
-        new_exp = (utcnow() + timedelta(seconds=extend)).isoformat()
-        _emit_event(db, principal, "work_heartbeat",
-                    {"work_id": work_id, "lease_id": lease_id, "new_expiry": new_exp})
-        db.execute("UPDATE work_items SET lease_expires=? WHERE work_id=?", (new_exp, work_id))
+            row = db.execute("SELECT * FROM decisions WHERE request_id=?", (rid,)).fetchone()
+        if row["status"]!="approved": return err(f"status is '{row['status']}'", 409)
+        if row["requesting_principal"]!=p: raise HTTPException(403, "only requester may claim")
+        if expired(row["deadline"]): return err("expired", 410)
+        computed = digest(row["scope"], row["target"], p, params)
+        if computed != row["digest"]: return err("digest mismatch", 422)
+        exp = (now()+timedelta(seconds=CLAIM_TTL)).isoformat()
+        seq = emit(db, p, "decision_claimed", {"request_id":rid})
+        db.execute("UPDATE decisions SET status='claimed',claimed_at=?,claim_expires=? WHERE request_id=?", (now_iso(),exp,rid))
         db.commit()
-    return _ok({"ok": True, "new_expiry": new_exp}, 200)
+    return ok({"ok":True,"seq":seq,"claim_expires":exp}, 201)
 
-@app.post("/work/{work_id}/result")
-async def submit_result(work_id: str, request: Request, authorization: str = Header(default="")):
-    principal = _auth(authorization)
-    body      = await request.json()
-    lease_id  = body.get("lease_id")
-    result    = body.get("result")
-    if not lease_id:    return _err('"lease_id" required')
-    if result is None:  return _err('"result" required')
+@app.post("/decision/{rid}/consume")
+async def consume_decision(rid: str, authorization: str = Header(default="")):
+    p = auth(authorization)
     with get_db() as db:
-        row = db.execute("SELECT * FROM work_items WHERE work_id=?", (work_id,)).fetchone()
-        if not row:                      return _err("Not found", 404)
-        if row["lease_id"] != lease_id:  return _err("Stale lease", 403)
-        if row["lease_holder"] != principal: return _err("Not your lease", 403)
-        if row["status"] != "leased":    return _err("Not leased", 409)
-        if is_expired(row["lease_expires"]):
-            return _err("Lease expired — result rejected", 403)
-        seq = _emit_event(db, principal, "work_result",
-                          {"work_id": work_id, "lease_id": lease_id, "result": result})
-        db.execute("UPDATE work_items SET status='done', result_seq=?, lease_id=NULL, lease_holder=NULL WHERE work_id=?",
-                   (seq, work_id))
-        # Unblock dependents
-        blocked = db.execute("SELECT work_id, deps_json FROM work_items WHERE status='blocked'").fetchall()
-        for b in blocked:
-            bdeps = json.loads(b["deps_json"])
-            if work_id in bdeps:
-                if all(db.execute("SELECT status FROM work_items WHERE work_id=?", (d,)).fetchone()["status"] == "done"
-                       for d in bdeps):
-                    db.execute("UPDATE work_items SET status='ready' WHERE work_id=?", (b["work_id"],))
-                    _emit_event(db, "system", "work_item_unblocked", {"work_id": b["work_id"]})
+        row = db.execute("SELECT * FROM decisions WHERE request_id=?", (rid,)).fetchone()
+        if not row:                  return err("not found", 404)
+        if row["status"]!="claimed": return err(f"status is '{row['status']}'", 409)
+        if row["requesting_principal"]!=p: raise HTTPException(403)
+        seq = emit(db, p, "decision_consumed", {"request_id":rid})
+        db.execute("UPDATE decisions SET status='consumed' WHERE request_id=?", (rid,))
         db.commit()
-    return _ok({"ok": True, "seq": seq}, 201)
+    await broadcast({"type":"decision_consumed","request_id":rid,"seq":seq})
+    return ok({"ok":True,"seq":seq}, 201)
 
-@app.get("/missions/{mission_id}/next")
-async def next_action(mission_id: str, authorization: str = Header(default="")):
-    _auth(authorization)
+@app.get("/decisions")
+async def list_decisions(authorization: str = Header(default="")):
+    auth(authorization)
     with get_db() as db:
-        mission = db.execute("SELECT * FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
-        if not mission: return _err("Not found", 404)
-        items = db.execute("SELECT * FROM work_items WHERE mission_id=?", (mission_id,)).fetchall()
-        ready   = [{"work_id": i["work_id"], "description": i["description"], "capability": i["capability"]}
-                   for i in items if i["status"] == "ready"]
-        blocked = [{"work_id": i["work_id"], "description": i["description"], "waiting_on": json.loads(i["deps_json"])}
-                   for i in items if i["status"] == "blocked"]
-        leased  = [{"work_id": i["work_id"], "holder": i["lease_holder"], "expires": i["lease_expires"]}
-                   for i in items if i["status"] == "leased"]
-        done_ids = [i["work_id"] for i in items if i["status"] == "done"]
-        all_work_done = len(items) > 0 and all(i["status"] == "done" for i in items)
-        # Mission acceptance gate
-        status = mission["status"]
-        needs_acceptance = all_work_done and status == "active"
-        return _ok({"mission_id": mission_id, "objective": mission["objective"],
-                    "status": status, "ready": ready, "blocked": blocked, "leased": leased,
-                    "done_count": len(done_ids), "total": len(items),
-                    "needs_owner_acceptance": needs_acceptance,
-                    "accepted_at": mission["accepted_at"],
-                    "acceptance_note": mission["acceptance_note"]})
+        rows = db.execute("SELECT * FROM decisions ORDER BY seq DESC").fetchall()
+    return ok({"decisions":[dict(r) for r in rows]})
 
-@app.post("/mission/{mission_id}/accept")
-async def accept_mission(mission_id: str, request: Request, authorization: str = Header(default="")):
-    """Owner explicitly accepts completed mission — not self-asserted by principals."""
-    principal = _auth(authorization)
-    body = await request.json()
+# ── Room state snapshot ───────────────────────────────────────────────────────
+@app.get("/room")
+async def room_state(authorization: str = Header(default="")):
+    auth(authorization)
     with get_db() as db:
-        mission = db.execute("SELECT * FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
-        if not mission: return _err("Not found", 404)
-        if mission["owner"] != principal:
-            raise HTTPException(403, "Only mission owner may accept")
-        if mission["status"] != "active": return _err(f"Mission status is '{mission['status']}'", 409)
-        items = db.execute("SELECT status FROM work_items WHERE mission_id=?", (mission_id,)).fetchall()
-        if not all(i["status"] == "done" for i in items):
-            return _err("Cannot accept: not all work items are done", 409)
-        note    = body.get("note", "")
-        now_iso = utcnow_iso()
-        seq = _emit_event(db, principal, "mission_accepted",
-                          {"mission_id": mission_id, "note": note})
-        db.execute("UPDATE missions SET status='complete', accepted_at=?, acceptance_note=? WHERE mission_id=?",
-                   (now_iso, note, mission_id))
-        db.commit()
-    return _ok({"ok": True, "seq": seq, "mission_id": mission_id, "status": "complete"}, 201)
+        event_count = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        last_seq    = db.execute("SELECT MAX(seq) FROM events").fetchone()[0] or 0
+        missions    = db.execute("SELECT COUNT(*) FROM missions WHERE status='active'").fetchone()[0]
+        work_ready  = db.execute("SELECT COUNT(*) FROM work_items WHERE status='ready'").fetchone()[0]
+        work_leased = db.execute("SELECT COUNT(*) FROM work_items WHERE status='leased'").fetchone()[0]
+        work_done   = db.execute("SELECT COUNT(*) FROM work_items WHERE status='done'").fetchone()[0]
+        agents_avail= db.execute("SELECT COUNT(*) FROM agents WHERE status='available'").fetchone()[0]
+        agents_busy = db.execute("SELECT COUNT(*) FROM agents WHERE status='busy'").fetchone()[0]
+        pending_dec = db.execute("SELECT COUNT(*) FROM decisions WHERE status='pending'").fetchone()[0]
+    return ok({"event_count":event_count,"last_seq":last_seq,"active_missions":missions,
+               "work":{"ready":work_ready,"leased":work_leased,"done":work_done},
+               "agents":{"available":agents_avail,"busy":agents_busy},
+               "pending_decisions":pending_dec})
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
