@@ -452,6 +452,31 @@ async def work_queue(authorization: str = Header(default="")):
             })
     return ok({"queue": result, "ts": now_iso()})
 
+
+# ── Health endpoint (no auth — reachability check) ───────────────────────────
+@app.get("/health")
+async def health():
+    with get_db() as db:
+        last_seq = db.execute("SELECT MAX(seq) FROM events").fetchone()[0] or 0
+        event_count = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    return ok({"ok": True, "instance": "arcides-victus", "last_seq": last_seq,
+               "event_count": event_count, "transport": "sphera-room-v1"})
+
+# ── Token via query param (bootstrap only — for runtimes that cannot set headers) ──
+@app.get("/events-public")
+async def events_public(after: int = 0, token: str = ""):
+    """Read-only events endpoint accepting token as query param for bootstrap."""
+    import os
+    valid = {os.environ.get("CLAUDE_KEY",""), os.environ.get("SOBA_KEY",""), os.environ.get("ARCIDES_KEY","")}
+    if token not in valid or not token:
+        return JSONResponse({"error": "Unauthorized"}, 401)
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM events WHERE seq > ? ORDER BY seq", (after,)).fetchall()
+    events = [{"seq":r["seq"],"id":r["id"],"ts":r["ts"],"principal":r["principal"],
+               "type":r["type"],**json.loads(r["payload"])} for r in rows]
+    return ok({"events": events, "count": len(events),
+               "cursor": events[-1]["seq"] if events else after})
+
 if __name__ == "__main__":
     # All routes declared above - safe to start server now
     uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
