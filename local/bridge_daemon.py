@@ -69,7 +69,7 @@ def gmail_read():
         M = imaplib.IMAP4_SSL("imap.gmail.com")
         M.login(GMAIL_USER, GMAIL_PASS)
         M.select("INBOX")
-        _, ids = M.search(None, 'SUBJECT "SPHERA ROOM V0" UNSEEN')
+        _, ids = M.search(None, 'SUBJECT "SPHERA ROOM V0"')
         for num in (ids[0].split() if ids[0] else []):
             _, data = M.fetch(num, "(RFC822)")
             raw = email.message_from_bytes(data[0][1])
