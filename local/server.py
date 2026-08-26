@@ -525,3 +525,47 @@ async def auto_decompose(mid: str, authorization: str = Header(default="")):
     await broadcast({"type": "mission_decomposed", "mission_id": mid,
                      "objective": mission["objective"], "work_count": len(created)})
     return ok({"ok": True, "mission_id": mid, "work_items": created, "count": len(created)}, 201)
+
+# ── Bridge ingest endpoint (FIX 3 & 4) ───────────────────────────────────────
+@app.post("/bridge/ingest")
+async def bridge_ingest(request: Request, authorization: str = Header(default="")):
+    """
+    Bridge-only endpoint. Preserves true principal from signed bridge envelope.
+    Server-side dedup by source_message_id prevents duplicate ingestion.
+    """
+    token = authorization.replace("Bearer ", "").strip()
+    bridge_key = os.environ.get("BRIDGE_KEY", "br-sphera")
+    if token != bridge_key:
+        raise HTTPException(403, "Bridge key required")
+
+    body = await request.json()
+    principal        = body.get("principal", "unknown")
+    content          = body.get("content", "")
+    source_message_id = body.get("source_message_id", "")
+    transport        = body.get("transport", "gmail")
+    original_ts      = body.get("original_ts")
+
+    if not content:   return _err("content required")
+    if not principal: return _err("principal required")
+
+    with get_db() as db:
+        # Server-side dedup check
+        if source_message_id:
+            existing = db.execute(
+                "SELECT seq FROM events WHERE json_extract(payload,'$.source_message_id')=?",
+                (source_message_id,)
+            ).fetchone()
+            if existing:
+                return _ok({"duplicate": True, "seq": existing["seq"]}, 200)
+
+        seq = _emit_event(db, principal, "bridge_message", {
+            "content":           content,
+            "transport_provenance": transport,
+            "source_message_id": source_message_id,
+            "original_ts":       original_ts
+        })
+        db.commit()
+
+    await broadcast({"type": "bridge_message", "principal": principal,
+                     "content": content, "transport": transport, "seq": seq})
+    return _ok({"ok": True, "seq": seq, "principal": principal}, 201)
