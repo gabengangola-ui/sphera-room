@@ -477,6 +477,50 @@ async def events_public(after: int = 0, token: str = ""):
     return ok({"events": events, "count": len(events),
                "cursor": events[-1]["seq"] if events else after})
 
+# ── Bridge ingest endpoint (FIX 3 & 4) ───────────────────────────────────────
+@app.post("/bridge/ingest")
+async def bridge_ingest(request: Request, authorization: str = Header(default="")):
+    """
+    Bridge-only endpoint. Preserves true principal from signed bridge envelope.
+    Server-side dedup by source_message_id prevents duplicate ingestion.
+    """
+    token = authorization.replace("Bearer ", "").strip()
+    bridge_key = os.environ.get("BRIDGE_KEY", "br-sphera")
+    if token != bridge_key:
+        raise HTTPException(403, "Bridge key required")
+
+    body = await request.json()
+    principal        = body.get("principal", "unknown")
+    content          = body.get("content", "")
+    source_message_id = body.get("source_message_id", "")
+    transport        = body.get("transport", "gmail")
+    original_ts      = body.get("original_ts")
+
+    if not content:   return _err("content required")
+    if not principal: return _err("principal required")
+
+    with get_db() as db:
+        # Server-side dedup check
+        if source_message_id:
+            existing = db.execute(
+                "SELECT seq FROM events WHERE json_extract(payload,'$.source_message_id')=?",
+                (source_message_id,)
+            ).fetchone()
+            if existing:
+                return _ok({"duplicate": True, "seq": existing["seq"]}, 200)
+
+        seq = _emit_event(db, principal, "bridge_message", {
+            "content":           content,
+            "transport_provenance": transport,
+            "source_message_id": source_message_id,
+            "original_ts":       original_ts
+        })
+        db.commit()
+
+    await broadcast({"type": "bridge_message", "principal": principal,
+                     "content": content, "transport": transport, "seq": seq})
+    return _ok({"ok": True, "seq": seq, "principal": principal}, 201)
+
 if __name__ == "__main__":
     # All routes declared above - safe to start server now
     uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
@@ -526,46 +570,53 @@ async def auto_decompose(mid: str, authorization: str = Header(default="")):
                      "objective": mission["objective"], "work_count": len(created)})
     return ok({"ok": True, "mission_id": mid, "work_items": created, "count": len(created)}, 201)
 
-# ── Bridge ingest endpoint (FIX 3 & 4) ───────────────────────────────────────
-@app.post("/bridge/ingest")
-async def bridge_ingest(request: Request, authorization: str = Header(default="")):
-    """
-    Bridge-only endpoint. Preserves true principal from signed bridge envelope.
-    Server-side dedup by source_message_id prevents duplicate ingestion.
-    """
-    token = authorization.replace("Bearer ", "").strip()
-    bridge_key = os.environ.get("BRIDGE_KEY", "br-sphera")
-    if token != bridge_key:
-        raise HTTPException(403, "Bridge key required")
 
-    body = await request.json()
-    principal        = body.get("principal", "unknown")
-    content          = body.get("content", "")
-    source_message_id = body.get("source_message_id", "")
-    transport        = body.get("transport", "gmail")
-    original_ts      = body.get("original_ts")
+if __name__ == "__main__":
+    # All routes declared above - safe to start server now
+    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
 
-    if not content:   return _err("content required")
-    if not principal: return _err("principal required")
+# ── Auto-decompose endpoint ───────────────────────────────────────────────────
+@app.post("/mission/{mid}/decompose")
+async def auto_decompose(mid: str, authorization: str = Header(default="")):
+    """
+    Decompose mission objective into work items via rule-based decomposer.
+    Writes directly to DB — no self-HTTP-call, no port dependency.
+    Only mission owner may decompose. Idempotent check: fails if items already exist.
+    """
+    p = auth(authorization)
+    from decomposer import decompose
 
     with get_db() as db:
-        # Server-side dedup check
-        if source_message_id:
-            existing = db.execute(
-                "SELECT seq FROM events WHERE json_extract(payload,'$.source_message_id')=?",
-                (source_message_id,)
-            ).fetchone()
-            if existing:
-                return _ok({"duplicate": True, "seq": existing["seq"]}, 200)
+        mission = db.execute("SELECT * FROM missions WHERE mission_id=?", (mid,)).fetchone()
+        if not mission: return err("mission not found", 404)
+        if mission["owner"] != p: raise HTTPException(403, "owner only")
+        existing = db.execute("SELECT COUNT(*) FROM work_items WHERE mission_id=?", (mid,)).fetchone()[0]
+        if existing > 0:
+            return err(f"mission already has {existing} work item(s). Use manual work creation to add more.", 409)
 
-        seq = _emit_event(db, principal, "bridge_message", {
-            "content":           content,
-            "transport_provenance": transport,
-            "source_message_id": source_message_id,
-            "original_ts":       original_ts
-        })
+        plan    = decompose(mission["objective"])
+        created = []
+        wids    = []
+
+        for item in plan:
+            deps   = [wids[i] for i in item['dep_indices'] if i < len(wids)]
+            wid    = uid()
+            status = "blocked" if deps else "ready"
+            seq    = emit(db, p, "work_created", {
+                "work_id": wid, "mission_id": mid,
+                "description": item['description'],
+                "capability": item['capability'],
+                "deps": deps, "status": status
+            })
+            db.execute("INSERT INTO work_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (wid, mid, item['description'], item['capability'],
+                        json.dumps(deps), status, None, None, None, None, None, now_iso(), seq))
+            wids.append(wid)
+            created.append({"work_id": wid, "description": item['description'],
+                            "capability": item['capability'], "status": status})
         db.commit()
 
-    await broadcast({"type": "bridge_message", "principal": principal,
-                     "content": content, "transport": transport, "seq": seq})
-    return _ok({"ok": True, "seq": seq, "principal": principal}, 201)
+    await broadcast({"type": "mission_decomposed", "mission_id": mid,
+                     "objective": mission["objective"], "work_count": len(created)})
+    return ok({"ok": True, "mission_id": mid, "work_items": created, "count": len(created)}, 201)
+
