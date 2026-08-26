@@ -303,7 +303,10 @@ async function send(){
   const btn=document.getElementById('sbtn');
   btn.disabled=true;
   if(mode==='chat') await api('POST','/message',{content});
-  else if(mode==='mission') await api('POST','/mission',{objective:content});
+  else if(mode==='mission'){
+    const r=await api('POST','/mission',{objective:content});
+    if(r.mission_id) await api('POST',`/mission/${r.mission_id}/decompose`);
+  }
   inp.value='';
   setTimeout(()=>{btn.disabled=false;},500);
   poll();
