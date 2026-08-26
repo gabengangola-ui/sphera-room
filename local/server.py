@@ -496,8 +496,8 @@ async def bridge_ingest(request: Request, authorization: str = Header(default=""
     transport        = body.get("transport", "gmail")
     original_ts      = body.get("original_ts")
 
-    if not content:   return _err("content required")
-    if not principal: return _err("principal required")
+    if not content:   return err("content required")
+    if not principal: return err("principal required")
 
     with get_db() as db:
         # Server-side dedup check
@@ -507,7 +507,7 @@ async def bridge_ingest(request: Request, authorization: str = Header(default=""
                 (source_message_id,)
             ).fetchone()
             if existing:
-                return _ok({"duplicate": True, "seq": existing["seq"]}, 200)
+                return ok({"duplicate": True, "seq": existing["seq"]}, 200)
 
         seq = emit(db, principal, "bridge_message", {
             "content":           content,
@@ -519,7 +519,7 @@ async def bridge_ingest(request: Request, authorization: str = Header(default=""
 
     await broadcast({"type": "bridge_message", "principal": principal,
                      "content": content, "transport": transport, "seq": seq})
-    return _ok({"ok": True, "seq": seq, "principal": principal}, 201)
+    return ok({"ok": True, "seq": seq, "principal": principal}, 201)
 
 if __name__ == "__main__":
     # All routes declared above - safe to start server now
