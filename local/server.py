@@ -509,7 +509,7 @@ async def bridge_ingest(request: Request, authorization: str = Header(default=""
             if existing:
                 return _ok({"duplicate": True, "seq": existing["seq"]}, 200)
 
-        seq = _emit_event(db, principal, "bridge_message", {
+        seq = emit(db, principal, "bridge_message", {
             "content":           content,
             "transport_provenance": transport,
             "source_message_id": source_message_id,
