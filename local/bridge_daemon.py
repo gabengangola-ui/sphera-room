@@ -1,14 +1,15 @@
 """
-SPHERA Gmail Bridge Daemon v0.4
+SPHERA Gmail Bridge Daemon v0.5
 Soba review fixes:
-- UID-based IMAP (not sequence numbers — safe across reconnections)
-- Persists UIDVALIDITY + last_uid (detects mailbox reset)
-- Outbound ordering fix: failed SMTP cannot advance last_room_seq
-- Generic transport adapter interface (Gmail + Telegram share same contract)
-- Identity rule: transport credential ≠ identity claim
+1. Fresh cursor does not replay historical events (startup_seq tracks where to start outbound)
+2. Log actual source_id per message, not cursor last_uid
+3. last_uid advances only after confirmed ingest
+4. Outbound strictly ordered - seq N+1 blocked until N succeeds
+5. Single-instance PID lock
+6. Atomic cursor persistence (write temp + rename)
 """
-import json, os, time, imaplib, smtplib, email, email.mime.text
-import urllib.request
+import fcntl, json, os, sys, time, imaplib, smtplib, email, email.mime.text
+import urllib.request, tempfile
 from datetime import datetime, timezone
 
 ROOM_URL    = os.environ.get("SPHERA_URL",     "http://localhost:8765")
@@ -17,24 +18,45 @@ BRIDGE_KEY  = os.environ.get("BRIDGE_KEY",     "br-sphera")
 GMAIL_USER  = os.environ.get("GMAIL_USER",     "gabeng.angola@gmail.com")
 GMAIL_PASS  = os.environ.get("GMAIL_APP_PASS", "")
 POLL_SECS   = int(os.environ.get("BRIDGE_POLL",   "10"))
-CURSOR_FILE = os.environ.get("BRIDGE_CURSOR", "bridge_cursor.json")
+CURSOR_FILE = os.environ.get("BRIDGE_CURSOR",  "bridge_cursor.json")
+LOCK_FILE   = os.environ.get("BRIDGE_LOCK",    "bridge.lock")
 MAX_RETRY   = 3
 
-# ── Cursor ────────────────────────────────────────────────────────────────────
+# ── FIX 5: Single-instance PID lock ──────────────────────────────────────────
+def acquire_lock():
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        return lock_fd
+    except OSError:
+        print(f"[bridge] ERROR: another instance is running (lock: {LOCK_FILE}). Exiting.")
+        sys.exit(1)
+
+# ── FIX 6: Atomic cursor persistence ─────────────────────────────────────────
 def load_cursor():
     try:
         return json.load(open(CURSOR_FILE))
     except:
         return {
+            "last_uid":        0,
+            "uidvalidity":     None,
+            "seen_source_ids": [],
             "last_room_seq":   0,
-            "seen_source_ids": [],   # source_message_id strings (server dedup key)
-            "last_uid":        0,    # last IMAP UID processed
-            "uidvalidity":     None, # IMAP UIDVALIDITY — detects mailbox reset
-            "unsent_seqs":     []    # room seqs where outbound SMTP failed
+            "startup_seq":     None,   # FIX 1: outbound starts from here, not seq 0
+            "unsent_seqs":     [],
+            "pending_ingest":  []      # FIX 3: source_ids awaiting confirmed ingest
         }
 
 def save_cursor(c):
-    json.dump(c, open(CURSOR_FILE, "w"), indent=2)
+    # FIX 6: atomic write — temp file + fsync + rename
+    tmp = CURSOR_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(c, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CURSOR_FILE)
 
 # ── Room API ──────────────────────────────────────────────────────────────────
 def room(method, path, body=None, key=None):
@@ -49,119 +71,74 @@ def room(method, path, body=None, key=None):
     except Exception as e:
         return {"error": str(e)}
 
-# ── Generic transport adapter contract ───────────────────────────────────────
-class TransportMessage:
-    """Normalised inbound message — same structure regardless of transport."""
-    def __init__(self, source_id, principal, content, original_ts, transport):
-        self.source_id    = source_id    # globally unique (e.g. "gmail-UID-12345")
-        self.principal    = principal    # who sent it (from envelope, not transport cred)
-        self.content      = content
-        self.original_ts  = original_ts
-        self.transport    = transport    # "gmail" | "telegram" | etc.
-
-def ingest(msg: TransportMessage, cursor: dict) -> bool:
-    """Ingest a TransportMessage into the room. Returns True on success."""
-    if msg.source_id in cursor["seen_source_ids"]:
-        return True  # already seen — idempotent
-
-    r = room("POST", "/bridge/ingest", {
-        "principal":         msg.principal,
-        "content":           msg.content,
-        "source_message_id": msg.source_id,
-        "transport":         msg.transport,
-        "original_ts":       msg.original_ts
-    }, key=BRIDGE_KEY)
-
-    if r.get("seq") or r.get("duplicate"):
-        cursor["seen_source_ids"].append(msg.source_id)
-        if len(cursor["seen_source_ids"]) > 1000:
-            cursor["seen_source_ids"] = cursor["seen_source_ids"][-500:]
-        return True
-    return False  # ingest failed — do not mark seen
-
-# ── Gmail IMAP (UID-based) ────────────────────────────────────────────────────
-def parse_bridge_body(body: str):
-    """Parse SPHERA-BRIDGE envelope. Returns (principal, content) or None."""
+# ── Parse bridge message ──────────────────────────────────────────────────────
+def parse_bridge(body):
     if "SPHERA-BRIDGE" not in body: return None
     if "SPHERA-OUTBOUND" in body:   return None
     try:
         s = body.index("SPHERA-BRIDGE") + len("SPHERA-BRIDGE")
         e = body.index("END-SPHERA-BRIDGE")
-        d = json.loads(body[s:e].strip())
-        return d.get("principal", "soba"), d.get("content", "")
+        return json.loads(body[s:e].strip())
     except:
         return None
 
-def gmail_fetch_new(cursor: dict) -> list:
-    """Fetch new messages via UID SEARCH. Returns list of TransportMessage."""
-    if not GMAIL_PASS:
-        return []
+# ── Format outbound ───────────────────────────────────────────────────────────
+def format_outbound(event):
+    return (
+        "SPHERA-OUTBOUND\nSPHERA-BRIDGE\n"
+        + json.dumps({"seq": event.get("seq"), "principal": event.get("principal"),
+                      "type": event.get("type"), "content": event.get("content",""),
+                      "ts": event.get("ts"), "transport_provenance": "sphera-room-v2"}, indent=2)
+        + "\nEND-SPHERA-BRIDGE"
+    )
+
+# ── Gmail IMAP ────────────────────────────────────────────────────────────────
+def gmail_fetch_new(cursor):
+    if not GMAIL_PASS: return []
     msgs = []
     try:
         M = imaplib.IMAP4_SSL("imap.gmail.com")
         M.login(GMAIL_USER, GMAIL_PASS)
         M.select("INBOX")
-
-        # Check UIDVALIDITY — if changed, mailbox was reset, reset our UID cursor
-        ok, data = M.status("INBOX", "(UIDVALIDITY)")
+        # Check UIDVALIDITY
+        _, data = M.status("INBOX", "(UIDVALIDITY)")
         uidvalidity = int(data[0].decode().split("UIDVALIDITY")[1].strip().rstrip(")"))
         if cursor["uidvalidity"] != uidvalidity:
-            print(f"[bridge] UIDVALIDITY changed ({cursor['uidvalidity']} → {uidvalidity}), resetting UID cursor")
+            print(f"[bridge] UIDVALIDITY changed → resetting UID cursor")
             cursor["uidvalidity"] = uidvalidity
             cursor["last_uid"]    = 0
-
-        # UID SEARCH for messages newer than our last processed UID
-        search_criteria = f'SUBJECT "SPHERA ROOM V0" UID {cursor["last_uid"] + 1}:*'
-        ok, uid_data = M.uid("SEARCH", None, f'SUBJECT "SPHERA ROOM V0"')
+        # Fetch UIDs > last known
+        _, uid_data = M.uid("SEARCH", None, "ALL")
         all_uids = uid_data[0].split() if uid_data[0] else []
-
-        # Filter to only UIDs we haven't seen
         new_uids = [u for u in all_uids if int(u) > cursor["last_uid"]]
-
-        for uid in new_uids:
-            ok, data = M.uid("FETCH", uid, "(RFC822)")
-            if not data or not data[0]:
-                continue
+        for uid_b in new_uids:
+            uid_int = int(uid_b)
+            _, data = M.uid("FETCH", uid_b, "(RFC822)")
+            if not data or not data[0]: continue
             raw  = email.message_from_bytes(data[0][1])
             body = ""
             if raw.is_multipart():
                 for part in raw.walk():
                     if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode("utf-8", "ignore")
-                        break
+                        body = part.get_payload(decode=True).decode("utf-8","ignore"); break
             else:
-                body = raw.get_payload(decode=True).decode("utf-8", "ignore")
-
-            parsed = parse_bridge_body(body)
+                body = raw.get_payload(decode=True).decode("utf-8","ignore")
+            parsed = parse_bridge(body)
             if parsed:
-                principal, content = parsed
-                source_id = f"gmail-uid-{uidvalidity}-{uid.decode()}"
-                msgs.append(TransportMessage(
-                    source_id    = source_id,
-                    principal    = principal,
-                    content      = content,
-                    original_ts  = datetime.now(timezone.utc).isoformat(),
-                    transport    = "gmail"
-                ))
-            # Advance last_uid regardless (even non-bridge messages)
-            cursor["last_uid"] = max(cursor["last_uid"], int(uid))
-
+                src_id = f"gmail-uid-{uidvalidity}-{uid_int}"
+                msgs.append({"source_id": src_id, "uid": uid_int,
+                             "principal": parsed.get("principal","soba"),
+                             "content":   parsed.get("content",""),
+                             "ts":        parsed.get("ts", datetime.now(timezone.utc).isoformat())})
+            # FIX 2: track per-message uid, advance ONLY after confirmed ingest below
         M.logout()
+        return msgs, new_uids
     except Exception as e:
         print(f"[bridge] imap error: {e}")
-    return msgs
+        return [], []
 
-# ── Gmail SMTP outbound ───────────────────────────────────────────────────────
-def format_outbound(event: dict) -> str:
-    return (
-        "SPHERA-OUTBOUND\nSPHERA-BRIDGE\n"
-        + json.dumps({"seq": event.get("seq"), "principal": event.get("principal"),
-                      "type": event.get("type"), "content": event.get("content", ""),
-                      "ts": event.get("ts"), "transport_provenance": "sphera-room-v1"}, indent=2)
-        + "\nEND-SPHERA-BRIDGE"
-    )
-
-def smtp_send(subject: str, body: str, retry: int = MAX_RETRY) -> bool:
+# ── SMTP ──────────────────────────────────────────────────────────────────────
+def smtp_send(subject, body, retry=MAX_RETRY):
     if not GMAIL_PASS: return False
     for attempt in range(retry):
         try:
@@ -176,79 +153,108 @@ def smtp_send(subject: str, body: str, retry: int = MAX_RETRY) -> bool:
             return True
         except Exception as e:
             print(f"[bridge] smtp error (attempt {attempt+1}/{retry}): {e}")
-            time.sleep(2 ** attempt)
+            time.sleep(2**attempt)
     return False
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def run():
-    cursor = load_cursor()
-    print(f"[bridge] v0.4 | room:{ROOM_URL} | poll:{POLL_SECS}s")
-    print(f"[bridge] seq:{cursor['last_room_seq']} uid:{cursor['last_uid']} seen:{len(cursor['seen_source_ids'])}")
-    if not GMAIL_PASS:
-        print("[bridge] GMAIL_APP_PASS not set — Gmail polling disabled")
+    lock_fd = acquire_lock()  # FIX 5
+    cursor  = load_cursor()
 
-    while True:
-        try:
-            # INBOUND: Gmail → Room
-            for msg in gmail_fetch_new(cursor):
-                ok = ingest(msg, cursor)
-                if ok:
-                    print(f"[bridge] Gmail→Room: uid:{cursor['last_uid']} from {msg.principal}: {msg.content[:40]}")
+    # FIX 1: on fresh start, record current room seq as outbound baseline
+    # so we never resend historical events
+    if cursor["startup_seq"] is None:
+        r = room("GET", "/room")
+        cursor["startup_seq"]   = r.get("last_seq", 0)
+        cursor["last_room_seq"] = cursor["startup_seq"]
+        save_cursor(cursor)
+        print(f"[bridge] fresh start — outbound baseline set to seq:{cursor['startup_seq']}")
+
+    print(f"[bridge] v0.5 | room:{ROOM_URL} | poll:{POLL_SECS}s")
+    print(f"[bridge] uid:{cursor['last_uid']} seq:{cursor['last_room_seq']} seen:{len(cursor['seen_source_ids'])}")
+
+    try:
+        while True:
+            # ── INBOUND: Gmail → Room ─────────────────────────────────────
+            result = gmail_fetch_new(cursor)
+            msgs, new_uids = result if isinstance(result, tuple) else (result, [])
+
+            for msg in msgs:
+                src_id = msg["source_id"]
+                if src_id in cursor["seen_source_ids"]: continue
+
+                r = room("POST", "/bridge/ingest", {
+                    "principal":         msg["principal"],
+                    "content":           msg["content"],
+                    "source_message_id": src_id,
+                    "transport":         "gmail",
+                    "original_ts":       msg["ts"]
+                }, key=BRIDGE_KEY)
+
+                if r.get("seq") or r.get("duplicate"):
+                    # FIX 2: log actual source_id
+                    print(f"[bridge] Gmail→Room: {src_id} from {msg['principal']}: {msg['content'][:50]}")
+                    cursor["seen_source_ids"].append(src_id)
+                    if len(cursor["seen_source_ids"]) > 1000:
+                        cursor["seen_source_ids"] = cursor["seen_source_ids"][-500:]
+                    # FIX 3: advance last_uid ONLY after confirmed ingest
+                    cursor["last_uid"] = max(cursor["last_uid"], msg["uid"])
                 else:
-                    print(f"[bridge] ingest failed for {msg.source_id} — will retry")
+                    print(f"[bridge] ingest failed for {src_id} — will retry (last_uid NOT advanced)")
+                    # Do not advance last_uid — message will be retried next poll
 
-            # OUTBOUND: Room → Gmail
+            # ── OUTBOUND: Room → Gmail (strictly ordered) ─────────────────
             r = room("GET", f"/events?after={cursor['last_room_seq']}")
             events = r.get("events", [])
 
             for ev in events:
                 seq     = ev["seq"]
-                content = str(ev.get("content", ""))
+                content = str(ev.get("content",""))
 
-                # Skip bridge-originated events (loop prevention)
-                if ev.get("transport_provenance") == "gmail": 
-                    cursor["last_room_seq"] = seq
-                    continue
-                if "[bridge:" in content:
+                # Skip bridge-originated (loop prevention)
+                if ev.get("transport_provenance"): 
                     cursor["last_room_seq"] = seq
                     continue
 
-                # OUTBOUND ORDERING FIX:
-                # Only advance last_room_seq AFTER confirmed send
+                # FIX 4: strictly ordered — if unsent_seqs has anything, retry those first
+                if cursor["unsent_seqs"] and seq > min(cursor["unsent_seqs"]):
+                    print(f"[bridge] blocked at seq:{seq} — must retry unsent:{cursor['unsent_seqs']} first")
+                    break
+
                 sent = smtp_send("SPHERA ROOM V0", format_outbound(ev))
                 if sent:
                     print(f"[bridge] Room→Gmail: seq:{seq} ({ev['principal']}/{ev['type']})")
                     cursor["last_room_seq"] = seq
                     cursor["unsent_seqs"]   = [s for s in cursor["unsent_seqs"] if s != seq]
                 else:
-                    print(f"[bridge] SMTP failed seq:{seq} — queued")
+                    print(f"[bridge] SMTP failed seq:{seq} — queued, blocking further outbound")
                     if seq not in cursor["unsent_seqs"]:
                         cursor["unsent_seqs"].append(seq)
-                    # CRITICAL: do NOT advance last_room_seq past failed seq
+                    break  # FIX 4: stop processing — do not advance past failed seq
 
-            # Retry unsent
-            for seq in list(cursor["unsent_seqs"]):
+            # Retry unsent (in order)
+            for seq in sorted(cursor["unsent_seqs"]):
                 r2 = room("GET", f"/events?after={seq-1}")
-                evs = [e for e in r2.get("events", []) if e["seq"] == seq]
+                evs = [e for e in r2.get("events",[]) if e["seq"]==seq]
                 if evs and smtp_send("SPHERA ROOM V0", format_outbound(evs[0])):
                     print(f"[bridge] retry OK: seq:{seq}")
                     cursor["unsent_seqs"].remove(seq)
                     cursor["last_room_seq"] = max(cursor["last_room_seq"], seq)
 
-            save_cursor(cursor)
+            save_cursor(cursor)  # FIX 6: atomic
             time.sleep(POLL_SECS)
 
-        except KeyboardInterrupt:
-            print("\n[bridge] stopped.")
-            save_cursor(cursor)
-            break
-        except Exception as e:
-            print(f"[bridge] error: {e}")
-            time.sleep(POLL_SECS)
+    except KeyboardInterrupt:
+        print("\n[bridge] stopped.")
+    finally:
+        save_cursor(cursor)
+        lock_fd.close()
+        try: os.remove(LOCK_FILE)
+        except: pass
 
 if __name__ == "__main__":
     r = room("GET", "/health")
     if not r.get("ok"):
-        print(f"[bridge] room unreachable: {r}"); exit(1)
+        print(f"[bridge] room unreachable: {r}"); sys.exit(1)
     print(f"[bridge] room OK: seq:{r['last_seq']} events:{r['event_count']}")
     run()
