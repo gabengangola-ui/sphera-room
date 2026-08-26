@@ -6,462 +6,331 @@
 <title>SPHERA</title>
 <style>
 :root {
-  --bg:       #09090e;
-  --surface:  #111118;
-  --border:   #1c1c28;
-  --muted:    #2a2a3a;
-  --text:     #d8d8e8;
-  --dim:      #555570;
-  --claude:   #7c6af7;
-  --soba:     #06b6d4;
-  --arcides:  #f59e0b;
-  --system:   #333348;
-  --green:    #22c55e;
-  --red:      #ef4444;
+  --bg:#09090e; --surface:#111118; --border:#1c1c28; --muted:#2a2a3a;
+  --text:#d8d8e8; --dim:#555570; --claude:#7c6af7; --soba:#06b6d4;
+  --arcides:#f59e0b; --system:#333348; --green:#22c55e; --red:#ef4444; --orange:#f97316;
 }
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: var(--bg); color: var(--text); font-family: 'SF Mono','Fira Code',ui-monospace,monospace; height: 100vh; display: flex; flex-direction: column; overflow: hidden; font-size: 13px; }
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'SF Mono','Fira Code',ui-monospace,monospace;height:100vh;display:flex;flex-direction:column;overflow:hidden;font-size:13px}
 
 /* Header */
-.header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 16px; height: 44px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
-.logo { font-size: 15px; font-weight: 700; color: var(--claude); letter-spacing: 2px; }
-.conn-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-.conn-dot.live { background: var(--green); animation: pulse 2s infinite; }
-.conn-dot.dead { background: var(--red); }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
-.conn-url { font-size: 11px; color: var(--dim); }
-.header-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
-.hdr-input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 4px 8px; border-radius: 4px; font-family: inherit; font-size: 11px; }
-.hdr-input:focus { outline: none; border-color: var(--claude); }
-.btn-sm { background: var(--claude); color: white; border: none; border-radius: 4px; padding: 4px 12px; font-size: 11px; cursor: pointer; font-family: inherit; }
-.btn-sm:hover { opacity: .85; }
+.hdr{background:var(--surface);border-bottom:1px solid var(--border);padding:0 14px;height:42px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.logo{font-size:14px;font-weight:700;color:var(--claude);letter-spacing:2px}
+.dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.dot.live{background:var(--green);animation:pulse 2s infinite}
+.dot.dead{background:var(--red)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.hdr-url{font-size:10px;color:var(--dim)}
+.hdr-right{margin-left:auto;display:flex;gap:6px;align-items:center}
+.hdr-in{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:4px;font-family:inherit;font-size:11px}
+.hdr-in:focus{outline:none;border-color:var(--claude)}
+.hdr-btn{background:var(--claude);color:white;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;font-family:inherit}
+.hdr-btn:hover{opacity:.85}
 
 /* Layout */
-.layout { display: flex; flex: 1; overflow: hidden; }
+.layout{display:flex;flex:1;overflow:hidden}
 
-/* Left sidebar — principals + bridge */
-.left { width: 200px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto; }
-.sidebar-section { padding: 12px; border-bottom: 1px solid var(--border); }
-.sidebar-label { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
-.principal { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
-.p-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-.p-dot.claude  { background: var(--claude); }
-.p-dot.soba    { background: var(--soba); }
-.p-dot.arcides { background: var(--arcides); }
-.p-dot.system  { background: var(--system); }
-.p-name { font-size: 12px; flex: 1; }
-.p-meta { font-size: 9px; color: var(--dim); }
-.badge { background: var(--red); color: white; border-radius: 9px; font-size: 9px; padding: 1px 5px; }
-
-/* Bridge health */
-.health-row { display: flex; justify-content: space-between; font-size: 10px; padding: 2px 0; }
-.health-key { color: var(--dim); }
-.health-val { color: var(--text); }
-.health-val.ok { color: var(--green); }
-.health-val.err { color: var(--red); }
+/* Sidebar */
+.sidebar{width:190px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.sb-section{padding:10px 12px;border-bottom:1px solid var(--border)}
+.sb-label{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.principal{display:flex;align-items:center;gap:7px;padding:4px 0}
+.p-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.p-dot.claude{background:var(--claude)} .p-dot.soba{background:var(--soba)} .p-dot.arcides{background:var(--arcides)} .p-dot.system{background:var(--muted)}
+.p-name{font-size:11px;flex:1}
+.p-seq{font-size:9px;color:var(--dim)}
+.p-fresh{width:5px;height:5px;border-radius:50%;flex-shrink:0}
+.p-fresh.recent{background:var(--green)} .p-fresh.stale{background:var(--orange)} .p-fresh.offline{background:var(--muted)}
+.hr{display:flex;justify-content:space-between;font-size:10px;padding:2px 0}
+.hk{color:var(--dim)} .hv{color:var(--text)} .hv.ok{color:var(--green)} .hv.err{color:var(--red)} .hv.warn{color:var(--orange)}
 
 /* Main */
-.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.tabs{display:flex;border-bottom:1px solid var(--border);flex-shrink:0;height:36px}
+.tab{padding:0 14px;font-size:11px;cursor:pointer;color:var(--dim);border-bottom:2px solid transparent;display:flex;align-items:center;gap:5px;margin-bottom:-1px}
+.tab.active{color:var(--claude);border-bottom-color:var(--claude)}
+.tbadge{background:var(--red);color:white;border-radius:9px;font-size:9px;padding:0 4px}
+.pane{display:none;flex:1;overflow:hidden;flex-direction:column}
+.pane.active{display:flex}
 
-/* Tabs */
-.tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; height: 38px; }
-.tab { padding: 0 16px; font-size: 11px; cursor: pointer; color: var(--dim); border-bottom: 2px solid transparent; display: flex; align-items: center; gap: 6px; margin-bottom: -1px; }
-.tab.active { color: var(--claude); border-bottom-color: var(--claude); }
-.tab-badge { background: var(--red); color: white; border-radius: 9px; font-size: 9px; padding: 0 4px; }
-
-/* Chat pane */
-.chat { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
-.tab-pane { display: none; flex: 1; overflow: hidden; flex-direction: column; }
-.tab-pane.active { display: flex; }
-
-/* Message bubbles */
-.msg { display: flex; gap: 8px; animation: fadein .2s; }
-@keyframes fadein { from{opacity:0;transform:translateY(3px)} to{opacity:1;transform:none} }
-.msg-avatar { width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; flex-shrink: 0; margin-top: 2px; }
-.msg-avatar.claude  { background: #7c6af722; color: var(--claude); }
-.msg-avatar.soba    { background: #06b6d422; color: var(--soba); }
-.msg-avatar.arcides { background: #f59e0b22; color: var(--arcides); }
-.msg-avatar.system  { background: var(--muted); color: var(--dim); }
-.msg-body { flex: 1; }
-.msg-header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; }
-.msg-name { font-size: 11px; font-weight: 700; }
-.msg-name.claude  { color: var(--claude); }
-.msg-name.soba    { color: var(--soba); }
-.msg-name.arcides { color: var(--arcides); }
-.msg-name.system  { color: var(--dim); }
-.msg-time { font-size: 9px; color: var(--dim); }
-.msg-transport { font-size: 9px; color: var(--muted); background: var(--surface); padding: 1px 4px; border-radius: 3px; }
-.msg-content { font-size: 13px; color: var(--text); line-height: 1.5; }
-.msg-content.system { font-size: 10px; color: var(--dim); font-style: italic; }
-.msg-seq { font-size: 9px; color: var(--muted); margin-top: 2px; }
-.system-event-toggle { font-size: 10px; color: var(--dim); text-align: center; padding: 4px; cursor: pointer; }
-.system-event-toggle:hover { color: var(--claude); }
+/* Chat */
+.chat{flex:1;overflow-y:auto;padding:10px 14px;display:flex;flex-direction:column;gap:6px}
+.msg{display:flex;gap:8px;animation:fi .2s}
+@keyframes fi{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+.av{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;margin-top:1px}
+.av.claude{background:#7c6af722;color:var(--claude)} .av.soba{background:#06b6d422;color:var(--soba)} .av.arcides{background:#f59e0b22;color:var(--arcides)} .av.system{background:var(--muted);color:var(--dim)}
+.mb{flex:1}
+.mh{display:flex;align-items:baseline;gap:7px;margin-bottom:2px}
+.mn{font-size:11px;font-weight:700}
+.mn.claude{color:var(--claude)} .mn.soba{color:var(--soba)} .mn.arcides{color:var(--arcides)} .mn.system{color:var(--dim)}
+.mt{font-size:9px;color:var(--dim)}
+.mtr{font-size:9px;color:var(--muted);background:var(--surface);padding:1px 4px;border-radius:3px}
+.mc{font-size:13px;color:var(--text);line-height:1.5}
+.mc.sys{font-size:10px;color:var(--dim);font-style:italic}
+.ms{font-size:9px;color:var(--muted);margin-top:1px}
+.sys-tog{font-size:10px;color:var(--dim);text-align:center;padding:3px;cursor:pointer;border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin:4px 0}
+.sys-tog:hover{color:var(--claude)}
 
 /* Composer */
-.composer { border-top: 1px solid var(--border); padding: 10px 16px; flex-shrink: 0; }
-.composer-modes { display: flex; gap: 6px; margin-bottom: 8px; }
-.mode-btn { background: none; border: 1px solid var(--border); color: var(--dim); padding: 3px 10px; border-radius: 4px; font-size: 10px; cursor: pointer; font-family: inherit; }
-.mode-btn.active { border-color: var(--claude); color: var(--claude); background: #7c6af711; }
-.composer-row { display: flex; gap: 8px; }
-.composer-input { flex: 1; background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-family: inherit; font-size: 13px; resize: none; outline: none; line-height: 1.4; }
-.composer-input:focus { border-color: var(--claude); }
-.send-btn { background: var(--claude); color: white; border: none; border-radius: 6px; padding: 8px 16px; font-size: 13px; cursor: pointer; font-family: inherit; white-space: nowrap; }
-.send-btn:hover { opacity: .85; }
-.send-btn:disabled { background: var(--muted); cursor: not-allowed; }
-.composer-hint { font-size: 10px; color: var(--dim); margin-top: 5px; }
+.composer{border-top:1px solid var(--border);padding:8px 14px;flex-shrink:0}
+.modes{display:flex;gap:5px;margin-bottom:7px}
+.mdbtn{background:none;border:1px solid var(--border);color:var(--dim);padding:2px 10px;border-radius:4px;font-size:10px;cursor:pointer;font-family:inherit}
+.mdbtn.active{border-color:var(--claude);color:var(--claude);background:#7c6af711}
+.crow{display:flex;gap:7px}
+.cinput{flex:1;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:5px;font-family:inherit;font-size:13px;resize:none;outline:none;line-height:1.4}
+.cinput:focus{border-color:var(--claude)}
+.sbtn{background:var(--claude);color:white;border:none;border-radius:5px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+.sbtn:hover{opacity:.85} .sbtn:disabled{background:var(--muted);cursor:not-allowed}
+.chint{font-size:10px;color:var(--dim);margin-top:4px}
 
-/* Missions tab */
-.missions-pane { padding: 12px 16px; overflow-y: auto; }
-.mission-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 8px; }
-.mission-obj { font-size: 13px; margin-bottom: 6px; }
-.mission-meta { font-size: 10px; color: var(--dim); display: flex; gap: 12px; margin-bottom: 8px; }
-.prog-bar { height: 3px; background: var(--muted); border-radius: 2px; overflow: hidden; margin-bottom: 8px; }
-.prog-fill { height: 100%; background: var(--claude); }
-.work-item { font-size: 11px; padding: 4px 0; display: flex; gap: 8px; align-items: center; border-bottom: 1px solid var(--border); }
-.work-item:last-child { border: none; }
-.status-badge { padding: 1px 6px; border-radius: 3px; font-size: 9px; flex-shrink: 0; }
-.status-badge.ready   { background: #06b6d422; color: var(--soba); }
-.status-badge.blocked { background: #ef444422; color: var(--red); }
-.status-badge.leased  { background: #7c6af722; color: var(--claude); }
-.status-badge.done    { background: #22c55e22; color: var(--green); }
+/* Right panel */
+.right{width:190px;background:var(--surface);border-left:1px solid var(--border);padding:10px 12px;overflow-y:auto;flex-shrink:0}
+.rl{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.dcard{background:var(--bg);border:1px solid #f59e0b33;border-radius:5px;padding:8px;margin-bottom:8px;font-size:11px}
+.dscope{color:var(--arcides);margin-bottom:3px;font-size:10px}
+.dmeta{color:var(--dim);font-size:9px;margin-bottom:5px}
+.appbtn{background:#f59e0b22;color:var(--arcides);border:1px solid #f59e0b44;border-radius:3px;padding:3px 8px;font-size:10px;cursor:pointer;width:100%;font-family:inherit}
+.appbtn:hover{background:#f59e0b33}
+.empty{color:var(--dim);font-size:11px;text-align:center;padding:14px 0}
 
-/* Decisions panel */
-.right { width: 200px; background: var(--surface); border-left: 1px solid var(--border); padding: 12px; overflow-y: auto; flex-shrink: 0; }
-.right-label { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
-.decision-card { background: var(--bg); border: 1px solid #f59e0b33; border-radius: 5px; padding: 8px; margin-bottom: 8px; font-size: 11px; }
-.decision-scope { color: var(--arcides); margin-bottom: 4px; font-size: 10px; }
-.decision-meta { color: var(--dim); font-size: 9px; margin-bottom: 6px; }
-.approve-btn { background: #f59e0b22; color: var(--arcides); border: 1px solid #f59e0b44; border-radius: 3px; padding: 3px 8px; font-size: 10px; cursor: pointer; width: 100%; font-family: inherit; }
-.approve-btn:hover { background: #f59e0b33; }
-.empty-state { color: var(--dim); font-size: 11px; text-align: center; padding: 16px 0; }
+/* Mission cards */
+.mcard{background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:10px;margin-bottom:7px}
+.mobj{font-size:13px;margin-bottom:5px}
+.mmeta{font-size:10px;color:var(--dim);display:flex;gap:10px;margin-bottom:6px}
+.pb{height:3px;background:var(--muted);border-radius:2px;overflow:hidden;margin-bottom:6px}
+.pf{height:100%;background:var(--claude)}
+.wi{font-size:11px;padding:3px 0;display:flex;gap:7px;align-items:center;border-bottom:1px solid var(--border)}
+.wi:last-child{border:none}
+.wbadge{padding:1px 5px;border-radius:3px;font-size:9px;flex-shrink:0}
+.wbadge.ready{background:#06b6d422;color:var(--soba)} .wbadge.blocked{background:#ef444422;color:var(--red)} .wbadge.leased{background:#7c6af722;color:var(--claude)} .wbadge.done{background:#22c55e22;color:var(--green)}
 </style>
 </head>
 <body>
-
-<div class="header">
+<div class="hdr">
   <div class="logo">⬡ SPHERA</div>
-  <div class="conn-dot" id="conn-dot"></div>
-  <div class="conn-url" id="conn-url">not connected</div>
-  <div class="header-right">
-    <input class="hdr-input" id="srv-url" value="http://localhost:8765" placeholder="Server URL" style="width:180px">
-    <select class="hdr-input" id="who-select" onchange="switchIdentity()" style="width:110px">
-      <option value="ak-sphera">Arcides</option>
-      <option value="ck-sphera">Claude</option>
-      <option value="sk-sphera">Soba</option>
-    </select>
-    <input class="hdr-input" id="api-key" placeholder="API key" type="hidden">
-    <button class="btn-sm" onclick="connect()">Connect</button>
+  <div class="dot dead" id="dot"></div>
+  <div class="hdr-url" id="hurl">not connected</div>
+  <div class="hdr-right">
+    <input class="hdr-in" id="srv" value="http://localhost:8765" style="width:170px" placeholder="Server URL">
+    <button class="hdr-btn" onclick="connect()">Connect</button>
   </div>
 </div>
 
 <div class="layout">
-  <!-- Left sidebar -->
-  <div class="left">
-    <div class="sidebar-section">
-      <div class="sidebar-label">Principals</div>
-      <div id="principal-list">
-        <div class="principal"><div class="p-dot arcides"></div><span class="p-name">Arcides</span><span class="p-meta">owner</span></div>
-        <div class="principal"><div class="p-dot claude"></div><span class="p-name">Claude</span><span class="p-meta" id="claude-meta">—</span></div>
-        <div class="principal"><div class="p-dot soba"></div><span class="p-name">Soba</span><span class="p-meta" id="soba-meta">—</span></div>
+  <div class="sidebar">
+    <div class="sb-section">
+      <div class="sb-label">Principals</div>
+      <div id="plist">
+        <div class="principal"><div class="p-dot arcides"></div><span class="p-name">Arcides</span><span class="p-seq" id="pseq-arcides">—</span><div class="p-fresh offline" id="pfresh-arcides"></div></div>
+        <div class="principal"><div class="p-dot claude"></div><span class="p-name">Claude</span><span class="p-seq" id="pseq-claude">—</span><div class="p-fresh offline" id="pfresh-claude"></div></div>
+        <div class="principal"><div class="p-dot soba"></div><span class="p-name">Soba</span><span class="p-seq" id="pseq-soba">—</span><div class="p-fresh offline" id="pfresh-soba"></div></div>
       </div>
     </div>
-    <div class="sidebar-section">
-      <div class="sidebar-label">Bridge Health</div>
-      <div id="bridge-health">
-        <div class="health-row"><span class="health-key">daemon</span><span class="health-val err" id="bh-daemon">unknown</span></div>
-        <div class="health-row"><span class="health-key">last seq</span><span class="health-val" id="bh-seq">—</span></div>
-        <div class="health-row"><span class="health-key">events</span><span class="health-val" id="bh-events">—</span></div>
-        <div class="health-row"><span class="health-key">missions</span><span class="health-val" id="bh-missions">—</span></div>
-        <div class="health-row"><span class="health-key">decisions</span><span class="health-val" id="bh-decisions">—</span></div>
-      </div>
+    <div class="sb-section">
+      <div class="sb-label">Bridge Health</div>
+      <div class="hr"><span class="hk">status</span><span class="hv ok" id="bh-status">—</span></div>
+      <div class="hr"><span class="hk">last seq</span><span class="hv" id="bh-seq">—</span></div>
+      <div class="hr"><span class="hk">events</span><span class="hv" id="bh-ev">—</span></div>
+      <div class="hr"><span class="hk">missions</span><span class="hv" id="bh-ms">—</span></div>
+      <div class="hr"><span class="hk">decisions</span><span class="hv" id="bh-dc">—</span></div>
+      <div class="hr"><span class="hk">polled</span><span class="hv" id="bh-time">—</span></div>
     </div>
   </div>
 
-  <!-- Main -->
   <div class="main">
     <div class="tabs">
-      <div class="tab active" onclick="switchTab('chat')">Chat <span class="tab-badge" id="unread-badge" style="display:none">0</span></div>
-      <div class="tab" onclick="switchTab('missions')">Missions</div>
-      <div class="tab" onclick="switchTab('agents')">Agents</div>
+      <div class="tab active" onclick="tab('chat')">Chat <span class="tbadge" id="ubadge" style="display:none">0</span></div>
+      <div class="tab" onclick="tab('missions')">Missions</div>
+      <div class="tab" onclick="tab('agents')">Agents</div>
     </div>
 
-    <!-- Chat -->
-    <div class="tab-pane active" id="tab-chat" style="flex-direction:column;">
-      <div class="chat" id="chat-list"></div>
+    <div class="pane active" id="pane-chat" style="flex-direction:column">
+      <div class="chat" id="chatlist"></div>
       <div class="composer">
-        <div class="composer-modes">
-          <button class="mode-btn active" onclick="setMode('chat')" id="mode-chat">Chat</button>
-          <button class="mode-btn" onclick="setMode('mission')" id="mode-mission">Mission</button>
-          <button class="mode-btn" onclick="setMode('task')" id="mode-task">Task</button>
+        <div class="modes">
+          <button class="mdbtn active" onclick="md('chat')" id="md-chat">Chat</button>
+          <button class="mdbtn" onclick="md('mission')" id="md-mission">Mission</button>
+          <button class="mdbtn" onclick="md('task')" id="md-task">Task</button>
         </div>
-        <div class="composer-row">
-          <textarea class="composer-input" id="composer-input" rows="2" placeholder="Message the room…"></textarea>
-          <button class="send-btn" id="send-btn" onclick="send()">Send</button>
+        <div class="crow">
+          <textarea class="cinput" id="cin" rows="2" placeholder="Message the room…"></textarea>
+          <button class="sbtn" id="sbtn" onclick="send()">Send</button>
         </div>
-        <div class="composer-hint" id="composer-hint">Posting as arcides · Enter to send</div>
+        <div class="chint" id="chint">Posting as arcides · Enter to send</div>
       </div>
     </div>
 
-    <!-- Missions -->
-    <div class="tab-pane" id="tab-missions">
-      <div class="missions-pane" id="missions-list"><div class="empty-state">No active missions</div></div>
-    </div>
-
-    <!-- Agents -->
-    <div class="tab-pane" id="tab-agents">
-      <div class="missions-pane" id="agents-list"><div class="empty-state">No agents registered</div></div>
-    </div>
+    <div class="pane" id="pane-missions"><div style="padding:12px;overflow-y:auto;flex:1" id="mslist"><div class="empty">No missions</div></div></div>
+    <div class="pane" id="pane-agents"><div style="padding:12px;overflow-y:auto;flex:1" id="aglist"><div class="empty">No agents</div></div></div>
   </div>
 
-  <!-- Right panel — decisions -->
   <div class="right">
-    <div class="right-label">Decisions</div>
-    <div id="decisions-list"><div class="empty-state">None pending</div></div>
+    <div class="rl">Decisions</div>
+    <div id="dlist"><div class="empty">None pending</div></div>
   </div>
 </div>
 
 <script>
-let BASE = '', KEY = '', cursor = 0, mode = 'chat', pollTimer = null;
-let seenSeqs = new Set(), unread = 0, showSystem = false;
+// Arcides only — no identity switching in the console
+const KEY = 'Bearer ak-sphera';
+let BASE='', cursor=0, mode='chat', timer=null;
+let seenSeqs=new Set(), unread=0;
+let lastSeen={claude:0,soba:0,arcides:0};
 
-const COLORS = {claude:'claude', soba:'soba', arcides:'arcides', system:'system', bridge:'claude', test:'dim'};
+const fmt=ts=>{try{return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}catch{return''}};
+const p=ev=>(['claude','soba','arcides'].includes(ev.principal)?ev.principal:'system');
+const ini=s=>(s||'?')[0].toUpperCase();
 
-function fmt(ts) { try { return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); } catch{return '';} }
-function principal(p) { return p?.replace('bridge_','') || 'system'; }
-function initials(p) { return (p||'?')[0].toUpperCase(); }
-
-function setConn(live) {
-  document.getElementById('conn-dot').className = 'conn-dot ' + (live ? 'live' : 'dead');
-  document.getElementById('conn-url').textContent = live ? BASE : 'not connected';
+function setConn(live){
+  document.getElementById('dot').className='dot '+(live?'live':'dead');
+  document.getElementById('hurl').textContent=live?BASE:'not connected';
 }
 
-async function api(method, path, body) {
-  const opts = { method, headers: {'Authorization': KEY, 'Content-Type': 'application/json'} };
-  if (body) opts.body = JSON.stringify(body);
-  try {
-    const r = await fetch(BASE + path, opts);
-    return r.json();
-  } catch(e) { return {error: e.message}; }
+async function api(method,path,body){
+  const r=await fetch(BASE+path,{method,headers:{'Authorization':KEY,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+  return r.json();
 }
 
-function switchIdentity() {
-  const who = document.getElementById('who-select');
-  document.getElementById('api-key').value = who.value;
-  const names = {'ak-sphera':'Arcides','ck-sphera':'Claude','sk-sphera':'Soba'};
-  document.getElementById('composer-hint').textContent = `Posting as ${names[who.value]} · Enter to send`;
-  if (BASE) connect();
-}
-
-async function connect() {
-  BASE = document.getElementById('srv-url').value.replace(/\/$/,'');
-  const rawKey = document.getElementById('api-key').value.trim();
-  KEY = rawKey.startsWith('Bearer ') ? rawKey : `Bearer ${rawKey}`;
+async function connect(){
+  BASE=document.getElementById('srv').value.replace(/\/$/,'');
   setConn(false);
-  const r = await api('GET', '/health');
-  if (r.ok) {
-    setConn(true);
-    cursor = 0; unread = 0;
-    document.getElementById('chat-list').innerHTML = '';
-    seenSeqs.clear();
-    startPolling();
-  } else {
-    document.getElementById('conn-url').textContent = 'auth failed';
-  }
+  try{
+    const r=await api('GET','/health');
+    if(r.ok){setConn(true);cursor=0;unread=0;seenSeqs.clear();document.getElementById('chatlist').innerHTML='';startPoll();}
+    else document.getElementById('hurl').textContent='auth failed';
+  }catch(e){document.getElementById('hurl').textContent='unreachable';}
 }
 
-function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  poll();
-  pollTimer = setInterval(poll, 5000);
-}
+function startPoll(){if(timer)clearInterval(timer);poll();timer=setInterval(poll,4000);}
 
-async function poll() {
-  try {
+async function poll(){
+  try{
     // Events
-    const evts = await api('GET', `/events?after=${cursor}`);
-    if (evts.events?.length) {
-      evts.events.forEach(renderEvent);
-      cursor = evts.cursor;
-    }
+    const ev=await api('GET',`/events?after=${cursor}`);
+    if(ev.events?.length){ev.events.forEach(renderEvent);cursor=ev.cursor;}
     // Room state
-    const room = await api('GET', '/room');
-    if (room.last_seq !== undefined) {
-      document.getElementById('bh-daemon').textContent = 'live';
-      document.getElementById('bh-daemon').className = 'health-val ok';
-      document.getElementById('bh-seq').textContent = room.last_seq;
-      document.getElementById('bh-events').textContent = room.event_count;
-      document.getElementById('bh-missions').textContent = room.active_missions;
-      document.getElementById('bh-decisions').textContent = room.pending_decisions;
+    const rm=await api('GET','/room');
+    if(rm.last_seq!==undefined){
+      document.getElementById('bh-status').textContent='live';
+      document.getElementById('bh-status').className='hv ok';
+      document.getElementById('bh-seq').textContent=rm.last_seq;
+      document.getElementById('bh-ev').textContent=rm.event_count;
+      document.getElementById('bh-ms').textContent=rm.active_missions;
+      document.getElementById('bh-dc').textContent=rm.pending_decisions;
+      document.getElementById('bh-time').textContent=fmt(new Date().toISOString());
     }
     // Decisions
-    const dec = await api('GET', '/decisions');
-    renderDecisions((dec.decisions||[]).filter(d=>d.status==='pending'));
+    const dc=await api('GET','/decisions');
+    renderDecisions((dc.decisions||[]).filter(d=>d.status==='pending'));
     // Missions
-    const ms = await api('GET', '/missions');
+    const ms=await api('GET','/missions');
     renderMissions(ms.missions||[]);
     // Agents
-    const ag = await api('GET', '/agents');
+    const ag=await api('GET','/agents');
     renderAgents(ag.agents||[]);
-  } catch(e) {
-    setConn(false);
-  }
+  }catch(e){setConn(false);document.getElementById('bh-status').textContent='unreachable';document.getElementById('bh-status').className='hv err';}
 }
 
-function renderEvent(ev) {
-  if (seenSeqs.has(ev.seq)) return;
+function freshness(principal,seq){
+  const prev=lastSeen[principal]||0;
+  if(seq>prev){lastSeen[principal]=seq;}
+  // Show freshness based on how recently they posted relative to total events
+  const behind=cursor-lastSeen[principal];
+  if(behind<5) return 'recent';
+  if(behind<20) return 'stale';
+  return 'offline';
+}
+
+function renderEvent(ev){
+  if(seenSeqs.has(ev.seq))return;
   seenSeqs.add(ev.seq);
+  const pr=p(ev);
+  const content=ev.content||ev.objective||ev.description||ev.scope||'';
+  const isMsg=['message','bridge_message'].includes(ev.type);
+  const isSys=!isMsg;
 
-  const p = principal(ev.principal);
-  const isSystem = !['claude','soba','arcides'].includes(p);
-  const content = ev.content || ev.objective || ev.description || ev.scope || '';
-  const type = ev.type || '';
-
-  // System events — collapse behind toggle
-  if (isSystem || type.includes('_created') || type.includes('_approved') || type.includes('_expired')) {
-    if (!showSystem) {
-      // Just update system counter silently
-      addSystemDivider(`${p}: ${type} [seq:${ev.seq}]`);
-      return;
-    }
+  // Update principal freshness
+  if(['claude','soba','arcides'].includes(pr)){
+    document.getElementById(`pseq-${pr}`).textContent=`seq:${ev.seq}`;
+    const f=freshness(pr,ev.seq);
+    document.getElementById(`pfresh-${pr}`).className=`p-fresh ${f}`;
   }
 
-  if (!content) return;
+  if(!content) return;
+  if(isSys) return; // system events hidden — room stays clean
 
-  const chat = document.getElementById('chat-list');
-  const div = document.createElement('div');
-  div.className = 'msg';
-  const transport = ev.transport_provenance ? `<span class="msg-transport">${ev.transport_provenance}</span>` : '';
-  div.innerHTML = `
-    <div class="msg-avatar ${p}">${initials(p)}</div>
-    <div class="msg-body">
-      <div class="msg-header">
-        <span class="msg-name ${p}">${p}</span>
-        <span class="msg-time">${fmt(ev.ts)}</span>
-        ${transport}
-      </div>
-      <div class="msg-content ${isSystem ? 'system' : ''}">${String(content).replace(/</g,'&lt;').replace(/\n/g,'<br>')}</div>
-      <div class="msg-seq">seq:${ev.seq}</div>
-    </div>`;
-  chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
+  const cl=document.getElementById('chatlist');
+  const d=document.createElement('div');
+  d.className='msg';
+  const tr=ev.transport_provenance?`<span class="mtr">${ev.transport_provenance}</span>`:'';
+  d.innerHTML=`<div class="av ${pr}">${ini(pr)}</div><div class="mb"><div class="mh"><span class="mn ${pr}">${pr}</span><span class="mt">${fmt(ev.ts)}</span>${tr}</div><div class="mc">${String(content).replace(/</g,'&lt;').replace(/\n/g,'<br>')}</div><div class="ms">seq:${ev.seq}</div></div>`;
+  cl.appendChild(d);
+  cl.scrollTop=cl.scrollHeight;
 
-  // Update last seen
-  if (p === 'claude')  document.getElementById('claude-meta').textContent = `seq:${ev.seq}`;
-  if (p === 'soba')    document.getElementById('soba-meta').textContent = `seq:${ev.seq}`;
-
-  // Unread badge if tab not active
-  if (!document.getElementById('tab-chat').classList.contains('active')) {
-    unread++;
-    const b = document.getElementById('unread-badge');
-    b.style.display = 'inline'; b.textContent = unread;
+  if(!document.getElementById('pane-chat').classList.contains('active')){
+    unread++;const b=document.getElementById('ubadge');b.style.display='inline';b.textContent=unread;
   }
 }
 
-let lastSystemText = '';
-function addSystemDivider(text) {
-  if (lastSystemText === text) return;
-  lastSystemText = text;
-  const chat = document.getElementById('chat-list');
-  const existing = chat.querySelector('.system-event-toggle');
-  if (!existing) {
-    const div = document.createElement('div');
-    div.className = 'system-event-toggle';
-    div.textContent = '· · · system events hidden · click to show · · ·';
-    div.onclick = () => { showSystem = !showSystem; div.remove(); };
-    chat.appendChild(div);
-  }
+function renderDecisions(pending){
+  const el=document.getElementById('dlist');
+  if(!pending.length){el.innerHTML='<div class="empty">None pending</div>';return;}
+  el.innerHTML=pending.map(d=>`<div class="dcard"><div class="dscope">${d.scope}</div><div class="dmeta">by ${d.requesting_principal}</div><button class="appbtn" onclick="approve('${d.request_id}')">✓ Approve</button></div>`).join('');
 }
 
-function renderDecisions(pending) {
-  const el = document.getElementById('decisions-list');
-  if (!pending.length) { el.innerHTML = '<div class="empty-state">None pending</div>'; return; }
-  el.innerHTML = pending.map(d => `
-    <div class="decision-card">
-      <div class="decision-scope">${d.scope}</div>
-      <div class="decision-meta">by ${d.requesting_principal} · target: ${d.target}</div>
-      <button class="approve-btn" onclick="approve('${d.request_id}')">✓ Approve</button>
-    </div>`).join('');
-}
-
-function renderMissions(missions) {
-  const el = document.getElementById('missions-list');
-  if (!missions.length) { el.innerHTML = '<div class="empty-state">No missions</div>'; return; }
-  el.innerHTML = missions.map(m => {
-    const pct = m.total ? Math.round(m.done_count/m.total*100) : 0;
-    return `<div class="mission-card">
-      <div class="mission-obj">${m.objective}</div>
-      <div class="mission-meta"><span>${m.owner}</span><span>${m.done_count||0}/${m.work_count||0} done</span><span>${m.status}</span></div>
-      <div class="prog-bar"><div class="prog-fill" style="width:${pct}%"></div></div>
-    </div>`;
+function renderMissions(missions){
+  const el=document.getElementById('mslist');
+  if(!missions.length){el.innerHTML='<div class="empty">No missions</div>';return;}
+  el.innerHTML=missions.map(m=>{
+    const pct=m.total?Math.round(m.done_count/m.total*100):0;
+    return `<div class="mcard"><div class="mobj">${m.objective}</div><div class="mmeta"><span>${m.owner}</span><span>${m.done_count||0}/${m.work_count||0}</span><span>${m.status}</span></div><div class="pb"><div class="pf" style="width:${pct}%"></div></div></div>`;
   }).join('');
 }
 
-function renderAgents(agents) {
-  const el = document.getElementById('agents-list');
-  if (!agents.length) { el.innerHTML = '<div class="empty-state">No agents</div>'; return; }
-  el.innerHTML = agents.map(a => {
-    const caps = Array.isArray(a.capabilities) ? a.capabilities.join(', ') : a.capabilities;
-    return `<div class="mission-card">
-      <div class="mission-obj">${a.name}</div>
-      <div class="mission-meta"><span>${caps}</span><span class="${a.status==='available'?'health-val ok':'health-val err'}">${a.status}</span></div>
-    </div>`;
+function renderAgents(agents){
+  const el=document.getElementById('aglist');
+  if(!agents.length){el.innerHTML='<div class="empty">No agents</div>';return;}
+  el.innerHTML=agents.map(a=>{
+    const caps=Array.isArray(a.capabilities)?a.capabilities.join(', '):a.capabilities;
+    return `<div class="mcard"><div class="mobj">${a.name}</div><div class="mmeta"><span>${caps}</span><span class="${a.status==='available'?'hv ok':'hv err'}">${a.status}</span></div></div>`;
   }).join('');
 }
 
-async function send() {
-  const inp = document.getElementById('composer-input');
-  const content = inp.value.trim();
-  if (!content || !BASE) return;
-  const btn = document.getElementById('send-btn');
-  btn.disabled = true;
-
-  if (mode === 'chat') {
-    await api('POST', '/message', {content});
-  } else if (mode === 'mission') {
-    const r = await api('POST', '/mission', {objective: content});
-    if (r.mission_id) addSystemDivider(`Mission created: ${content}`);
-  } else if (mode === 'task') {
-    // Would need mission selection — show hint
-    document.getElementById('composer-hint').textContent = 'Select a mission first in the Missions tab';
-    btn.disabled = false; return;
-  }
-
-  inp.value = '';
-  setTimeout(() => { btn.disabled = false; }, 500);
-}
-
-function setMode(m) {
-  mode = m;
-  ['chat','mission','task'].forEach(x => {
-    document.getElementById(`mode-${x}`).className = 'mode-btn' + (x===m?' active':'');
-  });
-  const hints = {chat:'Posting as arcides · Enter to send', mission:'Describe mission objective · Enter to create', task:'Describe task · select mission first'};
-  document.getElementById('composer-hint').textContent = hints[m];
-  document.getElementById('composer-input').placeholder = {chat:'Message the room…', mission:'Mission objective…', task:'Task description…'}[m];
-}
-
-async function approve(rid) {
-  const note = prompt('Approval note (optional):') || '';
-  await api('POST', `/decision/${rid}/approve`, {note});
+async function send(){
+  const inp=document.getElementById('cin');
+  const content=inp.value.trim();
+  if(!content||!BASE)return;
+  const btn=document.getElementById('sbtn');
+  btn.disabled=true;
+  if(mode==='chat') await api('POST','/message',{content});
+  else if(mode==='mission') await api('POST','/mission',{objective:content});
+  inp.value='';
+  setTimeout(()=>{btn.disabled=false;},500);
   poll();
 }
 
-function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', ['chat','missions','agents'][i]===name));
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-  document.getElementById(`tab-${name}`).classList.add('active');
-  if (name === 'chat') { unread = 0; document.getElementById('unread-badge').style.display = 'none'; }
+async function approve(rid){
+  const note=prompt('Note (optional):')||'';
+  await api('POST',`/decision/${rid}/approve`,{note});
+  poll();
 }
 
-document.getElementById('composer-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-});
+function md(m){
+  mode=m;
+  ['chat','mission','task'].forEach(x=>document.getElementById(`md-${x}`).className='mdbtn'+(x===m?' active':''));
+  document.getElementById('chint').textContent={chat:'Posting as arcides · Enter to send',mission:'Create a mission · Enter to submit',task:'Describe task · select mission first'}[m];
+  document.getElementById('cin').placeholder={chat:'Message the room…',mission:'Mission objective…',task:'Task description…'}[m];
+}
 
-// Auto-connect as Arcides by default
-window.addEventListener('load', () => {
-  document.getElementById('api-key').value = 'ak-sphera';
-  document.getElementById('srv-url').value = 'http://localhost:8765';
-});
+function tab(name){
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',['chat','missions','agents'][i]===name));
+  document.querySelectorAll('.pane').forEach(p=>p.classList.remove('active'));
+  document.getElementById(`pane-${name}`).classList.add('active');
+  if(name==='chat'){unread=0;document.getElementById('ubadge').style.display='none';}
+}
+
+document.getElementById('cin').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
+window.addEventListener('load',()=>{document.getElementById('srv').value='http://localhost:8765';});
 </script>
 </body>
 </html>
