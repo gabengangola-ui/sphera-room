@@ -103,6 +103,16 @@ async def lifespan(app: FastAPI):
     with get_db() as db:
         recover(db); db.commit()
     print("[sphera] ready on :8765")
+    # Start orchestrator as background thread
+    try:
+        import threading as _threading
+        from orchestrator import Orchestrator as _Orch
+        _orch = _Orch()
+        _orch_thread = _threading.Thread(target=_orch.run, daemon=True)
+        _orch_thread.start()
+        print("[sphera] orchestrator running")
+    except Exception as e:
+        print(f"[sphera] orchestrator failed to start: {e}")
     yield
 
 app = FastAPI(title="SPHERA", version="2.0", lifespan=lifespan)
@@ -521,6 +531,17 @@ async def list_decisions(authorization:str=Header(default="")):
     with get_db() as db:
         rows=db.execute("SELECT * FROM decisions ORDER BY seq DESC").fetchall()
     return ok({"decisions":[dict(r) for r in rows]})
+
+@app.get("/orch/state")
+async def orch_state(authorization: str = Header(default="")):
+    """Live orchestrator state — who moves next, pending replies, stalls, wake required."""
+    auth(authorization)
+    try:
+        from orchestrator import Orchestrator
+        orch = Orchestrator()
+        return ok(orch.state_summary())
+    except Exception as e:
+        return ok({"error": str(e), "next_principal": None, "wake_required": [], "pending_replies": []})
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
