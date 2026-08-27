@@ -110,6 +110,7 @@ body{background:var(--bg);color:var(--text);font-family:'SF Mono','Fira Code',ui
   <div class="logo">⬡ SPHERA</div>
   <div class="dot dead" id="dot"></div>
   <div class="hdr-url" id="hurl">not connected</div>
+  <div id="next-move" style="margin-left:12px;font-size:11px;padding:3px 8px;border-radius:4px;background:#1c1c28;color:#555;display:none"></div>
   <div class="hdr-right">
     <input class="hdr-in" id="srv" value="http://localhost:8765" style="width:170px" placeholder="Server URL">
     <button class="hdr-btn" onclick="connect()">Connect</button>
@@ -228,7 +229,35 @@ async function poll(){
     // Agents
     const ag=await api('GET','/agents');
     renderAgents(ag.agents||[]);
+    // Orchestrator state
+    try{
+      const os=await api('GET','/orch/state');
+      renderOrchState(os);
+    }catch(e){}
   }catch(e){setConn(false);document.getElementById('bh-status').textContent='unreachable';document.getElementById('bh-status').className='hv err';}
+}
+
+function renderOrchState(s){
+  const el=document.getElementById('next-move');
+  if(!el) return;
+  const next=s.next_principal;
+  const wake=s.wake_required||[];
+  const stalled=s.stalled_missions||[];
+  if(!next && !wake.length && !stalled.length){el.style.display='none';return;}
+  el.style.display='block';
+  if(stalled.length){
+    el.style.background='#ef444422';el.style.color='#ef4444';
+    el.textContent=`⚠ Mission stalled — ${stalled.map(s=>s.mission_id).join(', ')}`;
+  } else if(wake.length){
+    el.style.background='#f59e0b22';el.style.color='#f59e0b';
+    el.textContent=`⏳ Native wake required: ${wake.join(', ')}`;
+  } else if(next){
+    const colors={claude:'#7c6af722',soba:'#06b6d422',arcides:'#f59e0b22',worker:'#22c55e22'};
+    const tc={claude:'#7c6af7',soba:'#06b6d4',arcides:'#f59e0b',worker:'#22c55e'};
+    el.style.background=colors[next]||'#1c1c28';
+    el.style.color=tc[next]||'#555';
+    el.textContent=`Next move: ${next}`;
+  }
 }
 
 function freshness(principal,seq){
