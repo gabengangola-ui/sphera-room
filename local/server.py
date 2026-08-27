@@ -63,7 +63,7 @@ def recover(db):
     n = utcnow_iso()
     for r in db.execute("SELECT work_id,lease_id FROM work_items WHERE status='leased' AND lease_expires<?", (n,)).fetchall():
         emit(db,"system","lease_expired",{"work_id":r["work_id"]})
-        db.execute("UPDATE work_items SET status='ready',assigned_to=NULL,lease_id=NULL,lease_expires=NULL WHERE work_id=?", (r["work_id"],))
+        db.execute("UPDATE work_items SET status='ready',lease_holder=NULL,lease_id=NULL,lease_expires=NULL WHERE work_id=?", (r["work_id"],))
     for r in db.execute("SELECT request_id FROM decisions WHERE status='claimed' AND claim_expires<?", (n,)).fetchall():
         emit(db,"system","decision_claim_expired",{"request_id":r["request_id"]})
         # BUG FIX (Soba): expired claim returns to pending, NOT approved.
@@ -72,9 +72,9 @@ def recover(db):
 
 def unblock(db, done_id):
     unblocked = []
-    for b in db.execute("SELECT work_id,deps FROM work_items WHERE status='blocked'").fetchall():
+    for b in db.execute("SELECT work_id,deps_json FROM work_items WHERE status='blocked'").fetchall():
         try:
-            deps = json.loads(b["deps"] or "[]")
+            deps = json.loads(b["deps_json"] or "[]")
         except: continue
         if done_id not in deps: continue
         if all(db.execute("SELECT status FROM work_items WHERE work_id=?", (d,)).fetchone()["status"]=="done" for d in deps if db.execute("SELECT status FROM work_items WHERE work_id=?", (d,)).fetchone()):
@@ -365,7 +365,7 @@ async def create_mission(req:Request, authorization:str=Header(default="")):
     mid = uid()
     with get_db() as db:
         seq = emit(db,p,"mission_created",{"mission_id":mid,"objective":b["objective"],"owner":p})
-        db.execute("INSERT INTO missions VALUES(?,?,?,?,?,?,?)",(mid,b["objective"],p,"active",utcnow_iso(),None,seq))
+        db.execute("INSERT INTO missions(mission_id,objective,owner,status,policy_json,created_at,version) VALUES(?,?,?,?,?,?,?)",(mid,b["objective"],p,"active","{}",utcnow_iso(),1))
         db.commit()
     return ok({"ok":True,"mission_id":mid,"seq":seq},201)
 
@@ -393,8 +393,8 @@ async def add_work(mid:str, req:Request, authorization:str=Header(default="")):
         if not m: return err("mission not found",404)
         if m["owner"]!=p: raise HTTPException(403,"owner only")
         wid=uid(); status="blocked" if deps else "ready"
-        seq=emit(db,p,"work_created",{"work_id":wid,"mission_id":mid,"description":b["description"],"capability":b["capability"],"deps":deps,"status":status})
-        db.execute("INSERT INTO work_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(wid,mid,b["description"],b["capability"],json.dumps(deps),status,None,None,None,None,None,utcnow_iso(),seq))
+        seq=emit(db,p,"work_created",{"work_id":wid,"mission_id":mid,"description":b["description"],"capability":b["capability"],"deps_json":deps,"status":status})
+        db.execute("INSERT INTO work_items(work_id,mission_id,description,capability,deps_json,status,created_at,version,attempt_count,max_attempts,lease_fencing_token) VALUES(?,?,?,?,?,?,?,1,0,3,0)",(wid,mid,b["description"],b["capability"],json.dumps(deps),status,utcnow_iso()))
         db.commit()
     return ok({"ok":True,"work_id":wid,"status":status,"seq":seq},201)
 
@@ -431,8 +431,8 @@ async def decompose(mid:str, authorization:str=Header(default="")):
             deps=[wids[-1]] if wids else []
             wid=uid(); status="blocked" if deps else "ready"
             desc=f"{'Implement' if cap not in ('testing','devops') else ('Test' if cap=='testing' else 'Deploy')} {cap}: {m['objective'][:40]}"
-            seq=emit(db,p,"work_created",{"work_id":wid,"mission_id":mid,"description":desc,"capability":cap,"deps":deps,"status":status})
-            db.execute("INSERT INTO work_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(wid,mid,desc,cap,json.dumps(deps),status,None,None,None,None,None,utcnow_iso(),seq))
+            seq=emit(db,p,"work_created",{"work_id":wid,"mission_id":mid,"description":desc,"capability":cap,"deps_json":deps,"status":status})
+            db.execute("INSERT INTO work_items(work_id,mission_id,description,capability,deps_json,status,created_at,version,attempt_count,max_attempts,lease_fencing_token) VALUES(?,?,?,?,?,?,?,1,0,3,0)",(wid,mid,desc,cap,json.dumps(deps),status,utcnow_iso()))
             wids.append(wid); created.append({"work_id":wid,"description":desc,"capability":cap,"status":status})
         db.commit()
     return ok({"ok":True,"mission_id":mid,"work_items":created,"count":len(created)},201)
@@ -467,7 +467,7 @@ async def claim_work(wid:str, req:Request, authorization:str=Header(default=""))
     secs=max(1,min(int(b.get("lease_seconds",60)),MAX_LEASE))
     lid=uid(); exp=(utcnow()+timedelta(seconds=secs)).isoformat()
     with get_db() as db:
-        cur=db.execute("UPDATE work_items SET status='leased',assigned_to=?,lease_id=?,lease_expires=? WHERE work_id=? AND status='ready'",(p,lid,exp,wid))
+        cur=db.execute("UPDATE work_items SET status='leased',lease_holder=?,lease_id=?,lease_expires=?,attempt_count=attempt_count+1 WHERE work_id=? AND status='ready'",(p,lid,exp,wid))
         if cur.rowcount!=1: return err("not available",409)
         seq=emit(db,p,"work_claimed",{"work_id":wid,"lease_id":lid,"lease_expires":exp}); db.commit()
     return ok({"ok":True,"lease_id":lid,"lease_expires":exp,"seq":seq},201)
@@ -484,10 +484,8 @@ async def submit_result(wid:str, req:Request, authorization:str=Header(default="
         if not row: return err("not found",404)
         if row["lease_id"]!=lid: return err("stale lease",403)
         if expired(row["lease_expires"]): return err("lease expired",403)
-        seq=emit(db,p,"work_result",{"work_id":wid,"result":result})
-        db.execute("UPDATE work_items SET status='done',result=?,result_seq=?,lease_id=NULL WHERE work_id=?",(json.dumps(result),seq,wid))
-        agent=db.execute("SELECT agent_id FROM agents WHERE current_work_id=?",(wid,)).fetchone()
-        if agent: db.execute("UPDATE agents SET status='available',current_work_id=NULL,lease_id=NULL WHERE agent_id=?",(agent["agent_id"],))
+        seq=emit(db,p,"work_result",{"work_id":wid,"result_summary":result})
+        db.execute("UPDATE work_items SET status='done',result_summary=?,result_seq=?,lease_id=NULL,lease_holder=NULL WHERE work_id=?",(json.dumps(result),seq,wid))
         unblocked=unblock(db,wid); db.commit()
     return ok({"ok":True,"seq":seq,"unblocked":unblocked},201)
 
@@ -553,3 +551,94 @@ async def orch_state(authorization: str = Header(default="")):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
+
+# ── Autonomous Mission Reconciliation ─────────────────────────────────────────
+@app.post("/mission/{mid}/reconcile")
+async def reconcile_mission(mid: str, authorization: str = Header(default="")):
+    """
+    Deterministic reconciliation pass for a single mission.
+    Run on startup and every orchestrator poll.
+    Order:
+    1. Expire/reclaim stale leases + increment fencing token
+    2. Promote dependency-satisfied blocked items to ready
+    3. Retry eligible failed/expired work (attempt_count < max_attempts)
+    4. If no autonomous path remains → create owner_required interrupt
+    """
+    p = auth(authorization)
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc).isoformat()
+
+    with get_db() as db:
+        mission = db.execute("SELECT * FROM missions WHERE mission_id=?", (mid,)).fetchone()
+        if not mission: return err("not found", 404)
+
+        actions = []
+
+        # 1. Expire stale leases + increment fencing
+        stale = db.execute(
+            "SELECT work_id, lease_fencing_token FROM work_items WHERE mission_id=? AND status='leased' AND lease_expires<?",
+            (mid, now)
+        ).fetchall()
+        for s in stale:
+            new_fence = s["lease_fencing_token"] + 1
+            db.execute(
+                "UPDATE work_items SET status='ready', lease_id=NULL, lease_holder=NULL, lease_expires=NULL, lease_fencing_token=? WHERE work_id=?",
+                (new_fence, s["work_id"])
+            )
+            emit(db, "system", "lease_expired_reclaimed", {"work_id": s["work_id"], "new_fencing_token": new_fence})
+            actions.append(f"reclaimed:{s['work_id'][:8]}")
+
+        # 2. Promote blocked → ready when all deps done
+        blocked = db.execute("SELECT * FROM work_items WHERE mission_id=? AND status='blocked'", (mid,)).fetchall()
+        for b in blocked:
+            try:
+                deps = json.loads(b["deps_json"] or "[]")
+            except Exception:
+                continue
+            if all(db.execute("SELECT status FROM work_items WHERE work_id=?", (d,)).fetchone()["status"] == "done"
+                   for d in deps if db.execute("SELECT status FROM work_items WHERE work_id=?", (d,)).fetchone()):
+                db.execute("UPDATE work_items SET status='ready' WHERE work_id=?", (b["work_id"],))
+                emit(db, "system", "work_unblocked", {"work_id": b["work_id"]})
+                actions.append(f"unblocked:{b['work_id'][:8]}")
+
+        # 3. Retry eligible failed/expired work
+        now_dt = datetime.now(timezone.utc)
+        retryable = db.execute(
+            "SELECT * FROM work_items WHERE mission_id=? AND status IN ('failed','ready') AND attempt_count>0 AND retry_at IS NOT NULL",
+            (mid,)
+        ).fetchall()
+        for r in retryable:
+            try:
+                retry_dt = datetime.fromisoformat(r["retry_at"].replace("Z", "+00:00"))
+                if now_dt >= retry_dt:
+                    db.execute("UPDATE work_items SET status='ready', retry_at=NULL WHERE work_id=?", (r["work_id"],))
+                    emit(db, "system", "work_retry_due", {"work_id": r["work_id"], "attempt": r["attempt_count"]})
+                    actions.append(f"retry:{r['work_id'][:8]}")
+            except Exception:
+                pass
+
+        # 4. Silent-zero invariant: active mission must have at least one runnable item
+        items = db.execute("SELECT status FROM work_items WHERE mission_id=?", (mid,)).fetchall()
+        statuses = [i["status"] for i in items]
+        has_runnable = any(s in ("ready", "leased") for s in statuses)
+        all_done = items and all(s == "done" for s in statuses)
+
+        if not has_runnable and not all_done and items:
+            # Create owner_required interrupt — idempotent
+            interrupt_key = f"owner_required:{mid}:no_runnable_path"
+            existing = db.execute(
+                "SELECT 1 FROM events WHERE json_extract(payload_json,'$.interrupt_key')=?",
+                (interrupt_key,)
+            ).fetchone()
+            if not existing:
+                emit(db, "system", "owner_required", {
+                    "mission_id": mid,
+                    "interrupt_key": interrupt_key,
+                    "reason": "no_autonomous_path",
+                    "statuses": statuses
+                })
+                actions.append("owner_required_interrupt_created")
+
+        db.commit()
+
+    return ok({"ok": True, "mission_id": mid, "actions": actions, "action_count": len(actions)}, 200)
