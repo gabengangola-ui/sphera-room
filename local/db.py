@@ -1,151 +1,223 @@
 """
-SPHERA db v2.0 — canonical event store.
-Soba spec: idempotent append, schema_version, WAL, proper indexes.
+SPHERA DB v3.0
+Based on Soba's migration 001_initial_schema.sql.
+Key additions over v2: outbox pattern, hash chain, fencing tokens, version counters.
 """
-import sqlite3, os
+import hashlib, json, os, sqlite3, uuid
+from datetime import datetime, timezone
 
-DB = os.environ.get("SPHERA_DB", "./sphera.db")
-SCHEMA_VERSION = 2
+DB_PATH = os.environ.get("SPHERA_DB", "./sphera.db")
+SCHEMA_VERSION = 3
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
+PRAGMA synchronous=NORMAL;
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    TEXT    NOT NULL UNIQUE,
+    ts          TEXT    NOT NULL,
+    principal   TEXT    NOT NULL,
+    type        TEXT    NOT NULL,
+    payload_json TEXT   NOT NULL DEFAULT '{}',
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    prev_hash   TEXT    NOT NULL DEFAULT '',
+    this_hash   TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS outbox (
+    outbox_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    TEXT    NOT NULL UNIQUE,
+    ts          TEXT    NOT NULL,
+    principal   TEXT    NOT NULL,
+    type        TEXT    NOT NULL,
+    payload_json TEXT   NOT NULL DEFAULT '{}',
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decisions (
+    request_id           TEXT PRIMARY KEY,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    requesting_principal TEXT NOT NULL,
+    scope                TEXT NOT NULL,
+    target               TEXT NOT NULL,
+    params_json          TEXT NOT NULL DEFAULT '{}',
+    bound_digest         TEXT NOT NULL,
+    deadline             TEXT,
+    version              INTEGER NOT NULL DEFAULT 1,
+    claimed_at           TEXT,
+    claim_expires        TEXT,
+    claim_fencing_token  INTEGER,
+    approved_at          TEXT,
+    consumed_at          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS missions (
+    mission_id      TEXT PRIMARY KEY,
+    objective       TEXT NOT NULL,
+    owner           TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    policy_json     TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL,
+    accepted_at     TEXT,
+    acceptance_note TEXT,
+    version         INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS work_items (
+    work_id              TEXT PRIMARY KEY,
+    mission_id           TEXT NOT NULL REFERENCES missions(mission_id),
+    description          TEXT NOT NULL,
+    capability           TEXT NOT NULL,
+    deps_json            TEXT NOT NULL DEFAULT '[]',
+    status               TEXT NOT NULL DEFAULT 'ready',
+    lease_id             TEXT,
+    lease_holder         TEXT,
+    lease_expires        TEXT,
+    lease_fencing_token  INTEGER NOT NULL DEFAULT 0,
+    result_seq           INTEGER,
+    result_summary       TEXT,
+    created_at           TEXT NOT NULL,
+    version              INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version     INTEGER PRIMARY KEY,
+    filename    TEXT    NOT NULL,
+    applied_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_seq        ON events(seq);
+CREATE INDEX IF NOT EXISTS idx_events_principal  ON events(principal);
+CREATE INDEX IF NOT EXISTS idx_events_type       ON events(type);
+CREATE INDEX IF NOT EXISTS idx_decisions_status  ON decisions(status);
+CREATE INDEX IF NOT EXISTS idx_work_mission      ON work_items(mission_id);
+CREATE INDEX IF NOT EXISTS idx_work_status       ON work_items(status);
+CREATE INDEX IF NOT EXISTS idx_outbox_created    ON outbox(created_at);
+"""
+
+class IdempotencyConflict(Exception):
+    pass
 
 def get_db():
-    conn = sqlite3.connect(DB, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")  # wait up to 5s on lock
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
-SCHEMA = """
--- Schema version tracking (Soba: controlled migrations, not ad hoc)
-CREATE TABLE IF NOT EXISTS schema_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
--- Canonical event ledger (Soba: append-only, DB-allocated seq, source of truth)
-CREATE TABLE IF NOT EXISTS events (
-    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id      TEXT NOT NULL UNIQUE,
-    principal     TEXT NOT NULL,
-    type          TEXT NOT NULL,
-    ts            TEXT NOT NULL,
-    payload_json  TEXT NOT NULL DEFAULT '{}',
-    provenance_json TEXT NOT NULL DEFAULT '{}'
-);
-
--- Soba: explicit index on (type, seq) and (principal, seq)
-CREATE INDEX IF NOT EXISTS idx_events_type_seq      ON events(type, seq);
-CREATE INDEX IF NOT EXISTS idx_events_principal_seq ON events(principal, seq);
-
--- Principals / presence
-CREATE TABLE IF NOT EXISTS principals (
-    principal_id  TEXT PRIMARY KEY,
-    role          TEXT NOT NULL DEFAULT 'agent',
-    status        TEXT NOT NULL DEFAULT 'offline',
-    heartbeat_at  TEXT,
-    last_seen_seq INTEGER DEFAULT 0,
-    capabilities_json TEXT NOT NULL DEFAULT '[]',
-    registered_at TEXT NOT NULL
-);
-
--- Missions
-CREATE TABLE IF NOT EXISTS missions (
-    mission_id   TEXT PRIMARY KEY,
-    objective    TEXT NOT NULL,
-    owner        TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'active'
-                     CHECK(status IN ('active','complete','cancelled')),
-    created_at   TEXT NOT NULL,
-    seq          INTEGER,
-    FOREIGN KEY (seq) REFERENCES events(seq)
-);
-
--- Work items
-CREATE TABLE IF NOT EXISTS work_items (
-    work_id       TEXT PRIMARY KEY,
-    mission_id    TEXT NOT NULL REFERENCES missions(mission_id),
-    description   TEXT NOT NULL,
-    capability    TEXT NOT NULL,
-    deps_json     TEXT NOT NULL DEFAULT '[]',
-    status        TEXT NOT NULL DEFAULT 'ready'
-                      CHECK(status IN ('ready','blocked','leased','done','failed')),
-    assigned_to   TEXT,
-    lease_id      TEXT,
-    lease_expires TEXT,
-    result_json   TEXT,
-    result_seq    INTEGER,
-    created_at    TEXT NOT NULL,
-    seq           INTEGER,
-    FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_work_mission ON work_items(mission_id);
-CREATE INDEX IF NOT EXISTS idx_work_status  ON work_items(status);
-
--- Decisions
-CREATE TABLE IF NOT EXISTS decisions (
-    request_id   TEXT PRIMARY KEY,
-    status       TEXT NOT NULL DEFAULT 'pending'
-                     CHECK(status IN ('pending','approved','rejected','claimed','consumed','expired')),
-    requesting_principal TEXT NOT NULL,
-    scope        TEXT NOT NULL,
-    target       TEXT NOT NULL,
-    params_json  TEXT NOT NULL DEFAULT '{}',
-    digest       TEXT NOT NULL,
-    deadline     TEXT,
-    claimed_at   TEXT,
-    claim_expires TEXT,
-    seq          INTEGER
-);
-"""
+def _hash_event(event_id, principal, type_, payload_str, prev_hash):
+    content = f"{event_id}|{principal}|{type_}|{payload_str}|{prev_hash}"
+    return hashlib.sha256(content.encode()).hexdigest()
 
 def init():
     with get_db() as db:
         db.executescript(SCHEMA)
-        # Set schema version
-        current = db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
-        if not current:
-            db.execute("INSERT INTO schema_meta(key,value) VALUES('version',?)", (str(SCHEMA_VERSION),))
-            db.commit()
-            print(f"[db] schema v{SCHEMA_VERSION} initialised: {DB}")
-        else:
-            v = int(current["value"])
-            if v < SCHEMA_VERSION:
-                # Future migrations go here
-                db.execute("UPDATE schema_meta SET value=? WHERE key='version'", (str(SCHEMA_VERSION),))
-                db.commit()
-                print(f"[db] schema migrated v{v}→v{SCHEMA_VERSION}: {DB}")
-            else:
-                print(f"[db] schema v{v} ready: {DB}")
+        # Record migration
+        db.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,filename,applied_at) VALUES(?,?,?)",
+            (1, "001_initial_schema.sql", datetime.now(timezone.utc).isoformat())
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('schema_version',?)",
+            (str(SCHEMA_VERSION),)
+        )
+        db.commit()
+    print(f"[db] schema v{SCHEMA_VERSION} ready: {DB_PATH}")
 
 def append_event(db, event_id, principal, type_, payload, provenance=None):
     """
-    Soba: idempotent append.
-    If event_id already exists, return original row (no duplicate).
-    If event_id exists but payload differs, raise IdempotencyConflict.
+    Idempotent event append with outbox pattern and hash chain.
+    
+    1. Write to outbox (visible only within this transaction)
+    2. Compute hash chain
+    3. Move to events (atomic with commit)
+    
     Returns (seq, was_duplicate).
+    Raises IdempotencyConflict if event_id exists with different payload.
     """
-    import json
-    payload_str    = json.dumps(payload, sort_keys=True)
-    provenance_str = json.dumps(provenance or {}, sort_keys=True)
-    from datetime import datetime, timezone
-    ts = datetime.now(timezone.utc).isoformat()
+    ts           = datetime.now(timezone.utc).isoformat()
+    payload_str  = json.dumps(payload, sort_keys=True)
+    prov_str     = json.dumps(provenance or {}, sort_keys=True)
 
-    try:
-        db.execute(
-            "INSERT INTO events(event_id,principal,type,ts,payload_json,provenance_json) VALUES(?,?,?,?,?,?)",
-            (event_id, principal, type_, ts, payload_str, provenance_str)
-        )
-        row = db.execute("SELECT seq FROM events WHERE event_id=?", (event_id,)).fetchone()
-        return row["seq"], False
-    except Exception as e:
-        if "UNIQUE constraint failed" in str(e):
-            # Soba: duplicate — verify content matches
-            existing = db.execute("SELECT seq,payload_json FROM events WHERE event_id=?", (event_id,)).fetchone()
-            if existing["payload_json"] != payload_str:
-                raise IdempotencyConflict(f"event_id={event_id} exists with different payload")
+    # Idempotency check
+    existing = db.execute(
+        "SELECT seq, payload_json FROM events WHERE event_id=?", (event_id,)
+    ).fetchone()
+    if existing:
+        if existing["payload_json"] == payload_str:
             return existing["seq"], True
-        raise
+        raise IdempotencyConflict(
+            f"event_id={event_id} already exists with different payload"
+        )
 
-class IdempotencyConflict(Exception):
-    pass
+    # Hash chain — get last event's hash
+    prev = db.execute("SELECT this_hash FROM events ORDER BY seq DESC LIMIT 1").fetchone()
+    prev_hash = prev["this_hash"] if prev else ""
+    this_hash = _hash_event(event_id, principal, type_, payload_str, prev_hash)
+
+    # Write to outbox first (outbox pattern)
+    db.execute(
+        "INSERT INTO outbox(event_id,ts,principal,type,payload_json,provenance_json,created_at) VALUES(?,?,?,?,?,?,?)",
+        (event_id, ts, principal, type_, payload_str, prov_str, ts)
+    )
+
+    # Move from outbox to events (atomic within same transaction)
+    db.execute(
+        "INSERT INTO events(event_id,ts,principal,type,payload_json,provenance_json,prev_hash,this_hash) VALUES(?,?,?,?,?,?,?,?)",
+        (event_id, ts, principal, type_, payload_str, prov_str, prev_hash, this_hash)
+    )
+    db.execute("DELETE FROM outbox WHERE event_id=?", (event_id,))
+
+    seq = db.execute("SELECT seq FROM events WHERE event_id=?", (event_id,)).fetchone()["seq"]
+    return seq, False
+
+def flush_outbox(db):
+    """
+    Flush any events stuck in outbox (e.g. after a crash mid-transaction).
+    Called on startup. Returns number flushed.
+    """
+    stuck = db.execute("SELECT * FROM outbox ORDER BY outbox_id").fetchall()
+    flushed = 0
+    for row in stuck:
+        # Check if already in events (idempotent)
+        exists = db.execute("SELECT 1 FROM events WHERE event_id=?", (row["event_id"],)).fetchone()
+        if not exists:
+            prev = db.execute("SELECT this_hash FROM events ORDER BY seq DESC LIMIT 1").fetchone()
+            prev_hash = prev["this_hash"] if prev else ""
+            this_hash = _hash_event(row["event_id"], row["principal"], row["type"],
+                                     row["payload_json"], prev_hash)
+            db.execute(
+                "INSERT INTO events(event_id,ts,principal,type,payload_json,provenance_json,prev_hash,this_hash) VALUES(?,?,?,?,?,?,?,?)",
+                (row["event_id"], row["ts"], row["principal"], row["type"],
+                 row["payload_json"], row["provenance_json"], prev_hash, this_hash)
+            )
+            flushed += 1
+        db.execute("DELETE FROM outbox WHERE event_id=?", (row["event_id"],))
+    if flushed:
+        db.commit()
+        print(f"[db] flushed {flushed} events from outbox on startup")
+    return flushed
+
+def verify_hash_chain(db) -> tuple:
+    """
+    Verify the hash chain integrity.
+    Returns (ok: bool, first_bad_seq: int|None).
+    """
+    events = db.execute("SELECT seq, event_id, principal, type, payload_json, prev_hash, this_hash FROM events ORDER BY seq").fetchall()
+    prev_hash = ""
+    for ev in events:
+        expected = _hash_event(ev["event_id"], ev["principal"], ev["type"], ev["payload_json"], prev_hash)
+        if expected != ev["this_hash"]:
+            return False, ev["seq"]
+        prev_hash = ev["this_hash"]
+    return True, None
