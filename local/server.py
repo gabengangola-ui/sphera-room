@@ -103,6 +103,16 @@ async def lifespan(app: FastAPI):
     with get_db() as db:
         recover(db); db.commit()
     print("[sphera] ready on :8765")
+    # Flush any events stuck in outbox from previous crash
+    try:
+        from db import flush_outbox
+        with get_db() as db:
+            flushed = flush_outbox(db)
+            if flushed:
+                print(f"[sphera] flushed {flushed} events from outbox on startup")
+    except Exception as e:
+        print(f"[sphera] outbox flush warning: {e}")
+
     # Start orchestrator as background thread
     try:
         import threading as _threading
