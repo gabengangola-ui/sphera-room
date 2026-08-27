@@ -1,286 +1,306 @@
 """
-SPHERA Orchestrator v0.1
-Soba specification: tracks who owes the next move, what work is executable,
-detects stalls, drives autonomous follow-on work creation.
-Never pretends a native session is alive when it is not.
+SPHERA Orchestrator v1.0
+The poke-elimination layer.
 
-State machine per Soba:
-- pending_reply(principal, source_seq, created_at, status)
-- ready_work queue
-- stalled_since / stall_detection
-- wake_required / native_available
-- last_progress_at / retry_count / attempt owner fencing
-- autonomous follow_on creation
+State machine that continuously tracks:
+- Who owes the next move (pending_reply)
+- What work is executable now (ready_work)
+- When missions have stalled (stalled_since)
+- Whether a native session is available or wake is required
 
-Honest principle: when native session wake is impossible → state = 'native_wake_required'
-not silence, not pretending, not Path 1 API calls.
+Runs on Arcides' machine. Never pretends native sessions are alive when they are not.
+Silence is an explicit state, not the default.
 """
-import json, os, sys, time, sqlite3, threading, urllib.request
+import json, os, sqlite3, sys, time, uuid
 from datetime import datetime, timezone, timedelta
 
-DB_PATH    = os.environ.get("SPHERA_DB",    "./sphera.db")
-ROOM_URL   = os.environ.get("SPHERA_URL",   "http://localhost:8765")
-CLAUDE_KEY = os.environ.get("CLAUDE_KEY",   "ck-sphera")
-BRIDGE_KEY = os.environ.get("BRIDGE_KEY",   "br-sphera")
-POLL_SECS  = int(os.environ.get("ORCH_POLL","15"))
-STALL_SECS = int(os.environ.get("ORCH_STALL","300"))  # 5 min stall threshold
-REPLY_SLA  = int(os.environ.get("ORCH_SLA", "180"))   # 3 min reply SLA
+DB_PATH    = os.environ.get("SPHERA_DB", "./sphera.db")
+STALL_SECS = int(os.environ.get("SPHERA_STALL_SECS", "300"))   # 5 min
+POLL_SECS  = int(os.environ.get("SPHERA_ORCH_POLL", "15"))
 
+# ── Schema ────────────────────────────────────────────────────────────────────
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS orch_pending_reply (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    principal   TEXT NOT NULL,
-    source_seq  INTEGER NOT NULL,
-    created_at  TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'pending',
-    cleared_by_seq INTEGER
+CREATE TABLE IF NOT EXISTS pending_reply (
+    id              TEXT PRIMARY KEY,
+    principal       TEXT NOT NULL,          -- who owes the response
+    source_seq      INTEGER NOT NULL,       -- the event that created this obligation
+    source_principal TEXT NOT NULL,         -- who triggered it
+    created_at      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending | resolved | native_wake_required | owner_required
+    resolved_at     TEXT,
+    resolved_by_seq INTEGER
 );
-CREATE TABLE IF NOT EXISTS orch_state (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    ts    TEXT NOT NULL
+
+CREATE TABLE IF NOT EXISTS orch_mission_state (
+    mission_id      TEXT PRIMARY KEY,
+    last_progress_at TEXT,
+    stalled_since   TEXT,
+    stall_count     INTEGER NOT NULL DEFAULT 0,
+    next_principal  TEXT,                   -- who moves next
+    status          TEXT NOT NULL DEFAULT 'active'  -- active | stalled | complete | owner_required
 );
-CREATE TABLE IF NOT EXISTS orch_stall_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    mission_id  TEXT,
-    work_id     TEXT,
-    stalled_at  TEXT NOT NULL,
-    reason      TEXT NOT NULL,
-    resolved_at TEXT
+
+CREATE TABLE IF NOT EXISTS orch_event_log (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,
+    event_type      TEXT NOT NULL,          -- turn_owed | work_ready | mission_stalled | wake_required | follow_on_created
+    payload         TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE INDEX IF NOT EXISTS idx_pending_principal ON pending_reply(principal, status);
+CREATE INDEX IF NOT EXISTS idx_orch_mission ON orch_mission_state(status);
 """
 
-def utcnow(): return datetime.now(timezone.utc)
-def utcnow_iso(): return utcnow().isoformat()
-
-def get_orch_db():
+def get_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
-def init_orch():
-    with get_orch_db() as db:
+def utcnow(): return datetime.now(timezone.utc)
+def utcnow_iso(): return utcnow().isoformat()
+def uid(): return str(uuid.uuid4())
+
+def orch_emit(db, event_type, payload):
+    db.execute("INSERT INTO orch_event_log(ts,event_type,payload) VALUES(?,?,?)",
+               (utcnow_iso(), event_type, json.dumps(payload)))
+
+def init_schema():
+    with get_db() as db:
         db.executescript(SCHEMA)
         db.commit()
+    print("[orch] schema ready")
 
-def room_call(method, path, body=None, key=None):
-    data = json.dumps(body).encode() if body else None
-    req  = urllib.request.Request(f"{ROOM_URL}{path}", data=data, method=method,
-           headers={"Authorization": f"Bearer {key or CLAUDE_KEY}",
-                    "Content-Type": "application/json"})
+# ── Principal turn tracking ───────────────────────────────────────────────────
+SPHERA_PRINCIPALS = {"claude", "soba", "arcides"}
+NATIVE_AVAILABLE = {
+    "claude":  False,  # No callable wake endpoint — requires human to open claude.ai
+    "soba":    False,  # No callable wake endpoint — requires human to open ChatGPT
+    "arcides": True,   # Always reachable — owns the hardware
+}
+
+def who_is_addressed(event: dict) -> set:
+    """Heuristic: which principals are addressed by this event."""
+    content = str(event.get("content", "")).lower()
+    addressed = set()
+    if "soba" in content:   addressed.add("soba")
+    if "claude" in content: addressed.add("claude")
+    if "arcides" in content or "owner" in content: addressed.add("arcides")
+    return addressed
+
+def record_pending_reply(db, principal, source_seq, source_principal):
+    """Record that principal owes a response to source_seq."""
+    # Check if already pending
+    existing = db.execute(
+        "SELECT id FROM pending_reply WHERE principal=? AND source_seq=? AND status='pending'",
+        (principal, source_seq)
+    ).fetchone()
+    if existing:
+        return  # Already tracked
+
+    native = NATIVE_AVAILABLE.get(principal, False)
+    status = "pending" if native else "native_wake_required"
+    rid = uid()
+    db.execute(
+        "INSERT INTO pending_reply VALUES(?,?,?,?,?,?,?,?)",
+        (rid, principal, source_seq, source_principal, utcnow_iso(), status, None, None)
+    )
+    orch_emit(db, "turn_owed", {
+        "principal": principal,
+        "source_seq": source_seq,
+        "source_principal": source_principal,
+        "native_available": native,
+        "status": status
+    })
+
+def resolve_pending_reply(db, principal, resolved_by_seq):
+    """Mark pending replies as resolved when principal responds."""
+    db.execute(
+        """UPDATE pending_reply
+           SET status='resolved', resolved_at=?, resolved_by_seq=?
+           WHERE principal=? AND status IN ('pending','native_wake_required')
+           AND source_seq < ?""",
+        (utcnow_iso(), resolved_by_seq, principal, resolved_by_seq)
+    )
+
+# ── Stall detection ───────────────────────────────────────────────────────────
+def check_mission_stalls(db):
+    """Detect missions with no progress in STALL_SECS."""
+    missions = db.execute("SELECT * FROM orch_mission_state WHERE status='active'").fetchall()
+    now = utcnow()
+    for m in missions:
+        last = m["last_progress_at"]
+        if not last:
+            continue
+        try:
+            last_dt = datetime.fromisoformat(last.replace("Z","+00:00"))
+        except Exception:
+            continue
+        idle = (now - last_dt).total_seconds()
+        if idle > STALL_SECS and not m["stalled_since"]:
+            db.execute(
+                "UPDATE orch_mission_state SET stalled_since=?, stall_count=stall_count+1, status='stalled' WHERE mission_id=?",
+                (utcnow_iso(), m["mission_id"])
+            )
+            orch_emit(db, "mission_stalled", {
+                "mission_id": m["mission_id"],
+                "idle_secs": int(idle),
+                "stall_count": m["stall_count"] + 1
+            })
+            print(f"[orch] STALLED: mission {m['mission_id'][:8]} idle {int(idle)}s")
+
+# ── Next move computation ─────────────────────────────────────────────────────
+def compute_next_move(db) -> dict:
+    """
+    Returns a dict describing the current room state:
+    - next_principal: who moves next
+    - pending_replies: list of owed responses
+    - ready_work: list of work items ready to claim
+    - stalled_missions: list of stalled missions
+    - wake_required: principals that need native wake
+    - last_progress_at: most recent activity timestamp
+    """
+    pending = db.execute(
+        "SELECT * FROM pending_reply WHERE status IN ('pending','native_wake_required') ORDER BY created_at"
+    ).fetchall()
+    wake_required = [p["principal"] for p in pending if p["status"] == "native_wake_required"]
+    pending_turns = [p["principal"] for p in pending if p["status"] == "pending"]
+
+    ready_work = []
     try:
-        r = urllib.request.urlopen(req, timeout=5)
-        return json.loads(r.read())
-    except Exception as e:
-        return {"error": str(e)}
+        rows = db.execute("SELECT * FROM work_items WHERE status='ready' LIMIT 10").fetchall()
+        ready_work = [{"work_id": r["work_id"], "capability": r["capability"],
+                       "description": r["description"][:50]} for r in rows]
+    except Exception:
+        pass
 
-def get_state(key, default=None):
-    with get_orch_db() as db:
-        row = db.execute("SELECT value FROM orch_state WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
+    stalled = db.execute(
+        "SELECT mission_id, stalled_since, stall_count FROM orch_mission_state WHERE status='stalled'"
+    ).fetchall()
 
-def set_state(key, value):
-    with get_orch_db() as db:
-        db.execute("INSERT OR REPLACE INTO orch_state(key,value,ts) VALUES(?,?,?)",
-                   (key, str(value), utcnow_iso()))
-        db.commit()
+    next_principal = None
+    if pending_turns:
+        next_principal = pending_turns[0]
+    elif wake_required:
+        next_principal = wake_required[0]
+    elif ready_work:
+        next_principal = "worker"
 
+    # Last progress
+    last_ev = db.execute("SELECT MAX(ts) FROM events").fetchone()
+    last_progress = last_ev[0] if last_ev else None
 
+    return {
+        "next_principal": next_principal,
+        "pending_replies": [{"principal": p["principal"], "source_seq": p["source_seq"],
+                             "status": p["status"]} for p in pending],
+        "ready_work": ready_work,
+        "stalled_missions": [{"mission_id": r["mission_id"][:8], "since": r["stalled_since"]}
+                             for r in stalled],
+        "wake_required": list(set(wake_required)),
+        "last_progress_at": last_progress,
+    }
+
+# ── Main replay loop ──────────────────────────────────────────────────────────
 class Orchestrator:
-    """
-    Continuously inspects room state and drives forward progress.
-    Records exact boundary where native session wake is required.
-    Never silent. Never pretending.
-    """
-
-    NATIVE_PRINCIPALS = {"claude", "soba"}
-    WORKER_PRINCIPALS = {"system", "bridge"}
-
     def __init__(self):
-        init_orch()
-        self.cursor = int(get_state("orch_cursor", 0))
-        self.last_progress = {}   # principal → datetime of last event
-        self.pending_turns = {}   # principal → source_seq that needs a reply
+        init_schema()
+        self.cursor = self._load_cursor()
         print(f"[orch] started at cursor:{self.cursor}")
 
-    def _save_cursor(self, seq):
+    def _load_cursor(self):
+        with get_db() as db:
+            row = db.execute("SELECT value FROM schema_meta WHERE key='orch_cursor'").fetchone()
+            return int(row["value"]) if row else 0
+
+    def _save_cursor(self, db, seq):
+        db.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('orch_cursor',?)", (str(seq),))
         self.cursor = seq
-        set_state("orch_cursor", seq)
 
-    def inspect(self):
-        """One inspection cycle."""
-        r = room_call("GET", f"/events?after={self.cursor}")
-        events = r.get("events", [])
+    def process_events(self):
+        with get_db() as db:
+            events = db.execute(
+                "SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT 200",
+                (self.cursor,)
+            ).fetchall()
 
-        for ev in events:
-            self._process_event(ev)
-            self._save_cursor(ev["seq"])
+            for ev in events:
+                seq       = ev["seq"]
+                principal = ev["principal"]
+                etype     = ev["type"]
+                try:
+                    payload = json.loads(ev["payload_json"])
+                except Exception:
+                    payload = {}
 
-        self._check_stalls()
-        self._check_reply_sla()
-        self._check_ready_work()
+                # 1. Resolve pending replies for this principal
+                if principal in SPHERA_PRINCIPALS:
+                    resolve_pending_reply(db, principal, seq)
 
-    def _process_event(self, ev):
-        """Update orchestration state from a new event."""
-        p   = ev.get("principal","")
-        seq = ev.get("seq", 0)
-        ts  = ev.get("ts","")
-        t   = ev.get("type","")
-        try:
-            self.last_progress[p] = datetime.fromisoformat(ts.replace("Z","+00:00"))
-        except Exception:
-            pass
-
-        # Clear pending reply if this principal just spoke
-        if p in self.pending_turns:
-            source_seq = self.pending_turns.get(p)
-            if source_seq and seq > source_seq:
-                del self.pending_turns[p]
-                with get_orch_db() as db:
+                # 2. Track mission progress
+                mission_id = payload.get("mission_id")
+                if mission_id:
                     db.execute(
-                        "UPDATE orch_pending_reply SET status='cleared',cleared_by_seq=? WHERE principal=? AND status='pending'",
-                        (seq, p)
+                        """INSERT INTO orch_mission_state(mission_id, last_progress_at, status)
+                           VALUES(?,?,?) ON CONFLICT(mission_id) DO UPDATE SET
+                           last_progress_at=excluded.last_progress_at,
+                           stalled_since=NULL, status='active'""",
+                        (mission_id, ev["ts"], "active")
                     )
-                    db.commit()
-                print(f"[orch] {p} cleared pending reply at seq:{seq}")
 
-        # Track who is owed a reply
-        if p == "arcides" or p == "soba":
-            # Claude owes a reply
-            if p != "claude" and "claude" not in self.pending_turns:
-                self.pending_turns["claude"] = seq
-                self._record_pending_reply("claude", seq)
-        if p == "arcides" or p == "claude":
-            # Soba owes a reply
-            if p != "soba" and "soba" not in self.pending_turns:
-                self.pending_turns["soba"] = seq
-                self._record_pending_reply("soba", seq)
+                # 3. Detect who is addressed and record pending replies
+                if etype in ("message", "bridge_message") and principal in SPHERA_PRINCIPALS:
+                    addressed = who_is_addressed(payload)
+                    # If no one explicitly addressed, both Claude and Soba might respond
+                    if not addressed and principal == "arcides":
+                        addressed = {"claude", "soba"}
+                    for p in addressed:
+                        if p != principal and p in SPHERA_PRINCIPALS:
+                            record_pending_reply(db, p, seq, principal)
 
-    def _record_pending_reply(self, principal, source_seq):
-        with get_orch_db() as db:
-            # Don't duplicate
-            ex = db.execute(
-                "SELECT id FROM orch_pending_reply WHERE principal=? AND status='pending'",
-                (principal,)
-            ).fetchone()
-            if not ex:
-                db.execute(
-                    "INSERT INTO orch_pending_reply(principal,source_seq,created_at,status) VALUES(?,?,?,?)",
-                    (principal, source_seq, utcnow_iso(), "pending")
-                )
+                # 4. Work completion → unblock follow-on
+                if etype == "work_result":
+                    work_id = payload.get("work_id","")
+                    orch_emit(db, "work_completed", {"work_id": work_id, "seq": seq})
+
+                self._save_cursor(db, seq)
+
+            # 5. Check for stalls
+            check_mission_stalls(db)
+
+            if events:
                 db.commit()
+            return len(events)
 
-    def _check_reply_sla(self):
-        """Check if any principal has breached their reply SLA."""
-        now = utcnow()
-        with get_orch_db() as db:
-            pending = db.execute(
-                "SELECT * FROM orch_pending_reply WHERE status='pending'"
-            ).fetchall()
+    def state_summary(self) -> dict:
+        with get_db() as db:
+            return compute_next_move(db)
 
-        for row in pending:
-            try:
-                created = datetime.fromisoformat(row["created_at"].replace("Z","+00:00"))
-            except Exception:
-                continue
-            age_secs = (now - created).total_seconds()
-            if age_secs > REPLY_SLA:
-                principal = row["principal"]
-                print(f"[orch] NATIVE_WAKE_REQUIRED: {principal} owes reply (age:{int(age_secs)}s, SLA:{REPLY_SLA}s)")
-                set_state(f"wake_required_{principal}",
-                          json.dumps({"principal": principal, "source_seq": row["source_seq"],
-                                      "age_secs": int(age_secs), "native_available": False,
-                                      "reason": "native_session_dormant",
-                                      "ts": utcnow_iso()}))
-
-    def _check_stalls(self):
-        """Detect stalled missions — active work but no progress."""
-        r = room_call("GET", "/room")
-        if r.get("error"):
-            return
-
-        work = r.get("work", {})
-        if work.get("leased", 0) > 0:
-            # There's leased work — check when last progress happened
-            now = utcnow()
-            all_last = list(self.last_progress.values())
-            if all_last:
-                most_recent = max(all_last)
-                idle_secs = (now - most_recent).total_seconds()
-                if idle_secs > STALL_SECS:
-                    print(f"[orch] STALL DETECTED: no progress for {int(idle_secs)}s")
-                    with get_orch_db() as db:
-                        db.execute(
-                            "INSERT INTO orch_stall_log(stalled_at,reason) VALUES(?,?)",
-                            (utcnow_iso(), f"no_progress_{int(idle_secs)}s")
-                        )
-                        db.commit()
-                    # Post stall event to room
-                    room_call("POST", "/bridge/ingest", {
-                        "principal": "system",
-                        "content": f"[orch] Mission stall detected: no progress for {int(idle_secs//60)}min. Leased work exists but no activity.",
-                        "source_message_id": f"orch-stall-{int(time.time())}",
-                        "transport": "orchestrator",
-                        "original_ts": utcnow_iso()
-                    }, key=BRIDGE_KEY)
-
-    def _check_ready_work(self):
-        """Check for ready work and log if principals haven't claimed it."""
-        r = room_call("GET", "/room")
-        if r.get("error"):
-            return
-        ready = r.get("work", {}).get("ready", 0)
-        if ready > 0:
-            set_state("ready_work_count", ready)
-
-    def next_move_summary(self) -> dict:
-        """Return honest state of who owes the next move."""
-        pending = {}
-        with get_orch_db() as db:
-            rows = db.execute(
-                "SELECT * FROM orch_pending_reply WHERE status='pending'"
-            ).fetchall()
-        for row in rows:
-            pending[row["principal"]] = {
-                "source_seq": row["source_seq"],
-                "created_at": row["created_at"],
-                "status": "native_wake_required"  # always honest
-            }
-
-        r = room_call("GET", "/room")
-        ready = r.get("work",{}).get("ready",0) if not r.get("error") else 0
-        leased = r.get("work",{}).get("leased",0) if not r.get("error") else 0
-
-        return {
-            "pending_replies": pending,
-            "ready_work": ready,
-            "leased_work": leased,
-            "last_progress": {k: v.isoformat() for k,v in self.last_progress.items()},
-            "ts": utcnow_iso()
-        }
-
-    def run(self):
-        """Continuous orchestration loop."""
+    def run(self, interval=POLL_SECS):
         while True:
             try:
-                self.inspect()
-                summary = self.next_move_summary()
-                if summary["pending_replies"] or summary["ready_work"]:
-                    print(f"[orch] {utcnow_iso()[:19]} | pending:{list(summary['pending_replies'].keys())} | ready_work:{summary['ready_work']}")
-                time.sleep(POLL_SECS)
+                n = self.process_events()
+                if n:
+                    state = self.state_summary()
+                    next_p = state.get("next_principal")
+                    wake   = state.get("wake_required", [])
+                    print(f"[orch] processed {n} events | next:{next_p} | wake_required:{wake}")
+                time.sleep(interval)
             except KeyboardInterrupt:
                 print("\n[orch] stopped.")
                 break
             except Exception as e:
                 print(f"[orch] error: {e}")
-                time.sleep(POLL_SECS)
-
+                time.sleep(interval)
 
 if __name__ == "__main__":
-    r = room_call("GET", "/health")
-    if not r.get("ok"):
-        print(f"[orch] room unreachable: {r}"); sys.exit(1)
-    print(f"[orch] room OK: seq:{r['last_seq']} events:{r['event_count']}")
     orch = Orchestrator()
+    # Print initial state
+    state = orch.state_summary()
+    print(f"[orch] initial state:")
+    print(f"  next_principal: {state['next_principal']}")
+    print(f"  pending_replies: {len(state['pending_replies'])}")
+    print(f"  ready_work: {len(state['ready_work'])}")
+    print(f"  wake_required: {state['wake_required']}")
     orch.run()
