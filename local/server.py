@@ -45,16 +45,14 @@ def get_db():
     return conn
 
 def init_db():
-    with get_db() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, ts TEXT NOT NULL, principal TEXT NOT NULL, type TEXT NOT NULL, payload TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS agents (agent_id TEXT PRIMARY KEY, name TEXT NOT NULL, capabilities TEXT NOT NULL DEFAULT '[]', registered_by TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', current_work_id TEXT, lease_id TEXT, lease_expires TEXT, registered_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS missions (mission_id TEXT PRIMARY KEY, objective TEXT NOT NULL, owner TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, completed_at TEXT, seq INTEGER);
-        CREATE TABLE IF NOT EXISTS work_items (work_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, description TEXT NOT NULL, capability TEXT NOT NULL, deps TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'ready', assigned_to TEXT, lease_id TEXT, lease_expires TEXT, result TEXT, result_seq INTEGER, created_at TEXT NOT NULL, seq INTEGER);
-        CREATE TABLE IF NOT EXISTS decisions (request_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', requesting_principal TEXT NOT NULL, scope TEXT NOT NULL, target TEXT NOT NULL, params TEXT NOT NULL DEFAULT '{}', digest TEXT NOT NULL, deadline TEXT, claimed_at TEXT, claim_expires TEXT, seq INTEGER);
-        CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
-        CREATE INDEX IF NOT EXISTS idx_work_status ON work_items(status);
-        """)
+    """Single entry point for schema — delegates to db.init() + migrate.migrate()."""
+    from db import init as db_init, flush_outbox, get_db as _get_db
+    from migrate import migrate
+    db_init()
+    migrate()
+    with _get_db() as _db:
+        flush_outbox(_db)
+        _db.commit()
 
 def emit(db, principal, type_, payload):
     from db import append_event
@@ -293,7 +291,7 @@ async def get_events(after:int=0, authorization:str=Header(default="")):
     auth(authorization)
     with get_db() as db:
         rows = db.execute("SELECT * FROM events WHERE seq>? ORDER BY seq",(after,)).fetchall()
-    events = [{"seq":r["seq"],"id":r["event_id"],"ts":r["ts"],"principal":r["principal"],"type":r["type"],**json.loads(r["payload_json"])} for r in rows]
+    events = [{"seq":r["seq"],"id":r["event_id"],"ts":r["ts"],"principal":r["principal"],"type":r["type"],**json.loads(r["payload_json"] if "payload_json" in r.keys() else r.get("payload","{}") )} for r in rows]
     return ok({"events":events,"count":len(events),"cursor":events[-1]["seq"] if events else after})
 
 @app.get("/events-public")
@@ -302,7 +300,7 @@ async def events_public(after:int=0, token:str=""):
     if not token or token not in valid: return JSONResponse({"error":"Unauthorized"},401)
     with get_db() as db:
         rows = db.execute("SELECT * FROM events WHERE seq>? ORDER BY seq",(after,)).fetchall()
-    events = [{"seq":r["seq"],"id":r["event_id"],"ts":r["ts"],"principal":r["principal"],"type":r["type"],**json.loads(r["payload_json"])} for r in rows]
+    events = [{"seq":r["seq"],"id":r["event_id"],"ts":r["ts"],"principal":r["principal"],"type":r["type"],**json.loads(r["payload_json"] if "payload_json" in r.keys() else r.get("payload","{}") )} for r in rows]
     return ok({"events":events,"count":len(events),"cursor":events[-1]["seq"] if events else after})
 
 # ── Messages ──────────────────────────────────────────────────────────────────
@@ -333,7 +331,7 @@ async def bridge_ingest(req:Request, authorization:str=Header(default="")):
     if not content: return err("content required")
     with get_db() as db:
         if src_id:
-            ex = db.execute("SELECT seq FROM events WHERE json_extract(payload,'$.source_message_id')=?",(src_id,)).fetchone()
+            ex = db.execute("SELECT seq FROM events WHERE json_extract(payload_json,'$.source_message_id')=?",(src_id,)).fetchone()
             if ex: return ok({"duplicate":True,"seq":ex["seq"]},200)
         seq = emit(db,principal,"bridge_message",{"content":content,"transport_provenance":transport,"source_message_id":src_id,"original_ts":orig_ts})
         db.commit()
