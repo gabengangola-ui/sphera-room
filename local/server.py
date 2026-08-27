@@ -165,20 +165,7 @@ def _make_envelope(row) -> dict:
 subscribers: list  # list[Subscriber] — populated at startup
 subscribers = []
 
-async def broadcast(event: dict):
-    """Enqueue normalised event into every subscriber queue. Overflow → close signal."""
-    dead = []
-    for sub in subscribers:
-        try:
-            sub.queue.put_nowait(event)
-        except asyncio.QueueFull:
-            # Signal overflow — sender task will close the connection
-            try: sub.queue.put_nowait({"_resync_required": True, "head_seq": event.get("seq")})
-            except asyncio.QueueFull: pass
-            dead.append(sub)
-    for sub in dead:
-        try: subscribers.remove(sub)
-        except ValueError: pass
+
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
@@ -307,7 +294,9 @@ async def post_message(req:Request, authorization:str=Header(default="")):
     if not content: return err("content required")
     with get_db() as db:
         seq = emit(db,p,"message",{"content":content}); db.commit()
-    await broadcast({"type":"message","principal":p,"content":content,"seq":seq})
+        # Broadcast canonical ledger row — never hand-build envelope
+        row = db.execute("SELECT * FROM events WHERE seq=?", (seq,)).fetchone()
+    await broadcast(_make_envelope(row))
     return ok({"ok":True,"seq":seq},201)
 
 # ── Bridge ingest ─────────────────────────────────────────────────────────────
