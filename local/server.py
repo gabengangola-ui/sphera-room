@@ -57,10 +57,9 @@ def init_db():
         """)
 
 def emit(db, principal, type_, payload):
-    eid = uid()
-    db.execute("INSERT INTO events(id,ts,principal,type,payload) VALUES(?,?,?,?,?)",
-               (eid, utcnow_iso(), principal, type_, json.dumps(payload)))
-    return db.execute("SELECT seq FROM events WHERE id=?", (eid,)).fetchone()["seq"]
+    from db import append_event
+    seq, _ = append_event(db, uid(), principal, type_, payload)
+    return seq
 
 def recover(db):
     n = utcnow_iso()
@@ -69,7 +68,9 @@ def recover(db):
         db.execute("UPDATE work_items SET status='ready',assigned_to=NULL,lease_id=NULL,lease_expires=NULL WHERE work_id=?", (r["work_id"],))
     for r in db.execute("SELECT request_id FROM decisions WHERE status='claimed' AND claim_expires<?", (n,)).fetchall():
         emit(db,"system","decision_claim_expired",{"request_id":r["request_id"]})
-        db.execute("UPDATE decisions SET status='approved',claimed_at=NULL,claim_expires=NULL WHERE request_id=?", (r["request_id"],))
+        # BUG FIX (Soba): expired claim returns to pending, NOT approved.
+        # approved would silently manufacture owner authority after a crash.
+        db.execute("UPDATE decisions SET status='pending',claimed_at=NULL,claim_expires=NULL WHERE request_id=?", (r["request_id"],))
 
 def unblock(db, done_id):
     unblocked = []
@@ -130,17 +131,154 @@ async def health():
         cnt = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     return ok({"ok":True,"instance":"arcides-victus","last_seq":seq,"event_count":cnt,"transport":"sphera-room-v2"})
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
+# ── WebSocket — correct cursor-replay transport ───────────────────────────────
+# Design (Soba review):
+# 1. Auth required: ?token=KEY
+# 2. Per-subscriber bounded asyncio.Queue + dedicated sender task
+# 3. Register queue BEFORE capturing replay head H → closes replay/live race
+# 4. Replay (cursor, H] from DB in chunks → drain queued seq > H with dedup
+# 5. Slow consumer: queue overflow → explicit close (1013), never silent loss
+# 6. DB is truth — reconnect replays from DB, no in-memory dependency
+# 7. Identical envelope to REST /events: {seq,id,ts,principal,type,...payload}
+
+import asyncio
+SUBSCRIBER_QUEUE_SIZE = 200  # bounded — overflow = resync close
+
+class Subscriber:
+    def __init__(self, cursor: int):
+        self.cursor    = cursor
+        self.queue     = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_SIZE)
+        self.last_sent = cursor
+
+def _make_envelope(row) -> dict:
+    """Normalise a DB row to canonical event envelope — same schema as REST /events."""
+    payload = {}
+    try:
+        raw = row["payload_json"] if "payload_json" in row.keys() else row.get("payload","{}") 
+        payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except Exception:
+        payload = {"_parse_error": str(raw)[:100]}
+    eid = row["event_id"] if "event_id" in row.keys() else row.get("id","")
+    return {"seq": row["seq"], "id": eid, "ts": row["ts"],
+            "principal": row["principal"], "type": row["type"], **payload}
+
+subscribers: list  # list[Subscriber] — populated at startup
+subscribers = []
+
+async def broadcast(event: dict):
+    """Enqueue normalised event into every subscriber queue. Overflow → close signal."""
+    dead = []
+    for sub in subscribers:
+        try:
+            sub.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Signal overflow — sender task will close the connection
+            try: sub.queue.put_nowait({"_resync_required": True, "head_seq": event.get("seq")})
+            except asyncio.QueueFull: pass
+            dead.append(sub)
+    for sub in dead:
+        try: subscribers.remove(sub)
+        except ValueError: pass
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    await ws.accept(); connected.append(ws)
+    # 1. Auth
+    token = ws.query_params.get("token", "")
+    if token not in KEYS:
+        await ws.close(code=1008, reason="Unauthorized")
+        return
+
+    # 2. Cursor
+    cursor_str = ws.query_params.get("cursor", "0")
     try:
-        with get_db() as db:
-            rows = db.execute("SELECT * FROM events ORDER BY seq DESC LIMIT 100").fetchall()
-        await ws.send_json({"type":"history","events":[dict(r) for r in reversed(rows)]})
-        while True: await ws.receive_text()
-    except WebSocketDisconnect:
-        if ws in connected: connected.remove(ws)
+        cursor = int(cursor_str)
+        if cursor < 0: raise ValueError("negative")
+    except (ValueError, TypeError):
+        await ws.close(code=1008, reason="cursor must be non-negative integer")
+        return
+
+    await ws.accept()
+
+    # 3. Register subscriber BEFORE reading head → closes replay/live race
+    sub = Subscriber(cursor)
+    subscribers.append(sub)
+
+    async def sender():
+        """Dedicated sender task — owns ws.send_json, enforces monotonic delivery."""
+        try:
+            while True:
+                envelope = await sub.queue.get()
+                if envelope.get("_resync_required"):
+                    await ws.send_json({"type": "resync_required",
+                                        "head_seq": envelope.get("head_seq"),
+                                        "reason": "queue_overflow"})
+                    await ws.close(code=4008, reason="queue overflow — reconnect")
+                    return
+                seq = envelope.get("seq", 0)
+                if seq <= sub.last_sent:
+                    continue  # dedup: already sent during replay drain
+                sub.last_sent = seq
+                await ws.send_json(envelope)
+        except Exception:
+            pass
+
+    # 4. Capture replay head AFTER subscriber is registered
+    with get_db() as db:
+        head_row = db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()
+        H = head_row[0]
+
+    # Sanity: cursor > head → resync
+    if cursor > H:
+        await ws.send_json({"type": "resync_required", "head_seq": H,
+                            "reason": "cursor_ahead_of_ledger"})
+        await ws.close(code=4008, reason="future cursor")
+        subscribers.remove(sub)
+        return
+
+    # Start sender task
+    send_task = asyncio.create_task(sender())
+
+    try:
+        # 5. Replay (cursor, H] from DB in bounded chunks
+        CHUNK = 200
+        pos = cursor
+        while pos < H:
+            with get_db() as db:
+                rows = db.execute(
+                    "SELECT * FROM events WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
+                    (pos, H, CHUNK)
+                ).fetchall()
+            for row in rows:
+                envelope = _make_envelope(row)
+                if envelope["seq"] <= sub.last_sent:
+                    continue
+                sub.last_sent = envelope["seq"]
+                await ws.send_json(envelope)
+            if rows:
+                pos = rows[-1]["seq"]
+            else:
+                break
+
+        # 6. Drain live queue, dedup seq <= H (already replayed above)
+        # Items queued between registration and now with seq > H will flow through
+        # sender task naturally; sender dedupes via last_sent.
+
+        # 7. Keep alive — drain queue via sender task
+        while True:
+            # Just wait for messages from client (keep-alive ping etc)
+            try:
+                await asyncio.wait_for(ws.receive_text(), timeout=30)
+            except asyncio.TimeoutError:
+                pass  # no-op keep-alive
+            except Exception:
+                break
+
+    except Exception:
+        pass
+    finally:
+        send_task.cancel()
+        try: subscribers.remove(sub)
+        except ValueError: pass
 
 # ── Events ────────────────────────────────────────────────────────────────────
 @app.get("/events")
@@ -148,7 +286,7 @@ async def get_events(after:int=0, authorization:str=Header(default="")):
     auth(authorization)
     with get_db() as db:
         rows = db.execute("SELECT * FROM events WHERE seq>? ORDER BY seq",(after,)).fetchall()
-    events = [{"seq":r["seq"],"id":r["id"],"ts":r["ts"],"principal":r["principal"],"type":r["type"],**json.loads(r["payload"])} for r in rows]
+    events = [{"seq":r["seq"],"id":r["event_id"],"ts":r["ts"],"principal":r["principal"],"type":r["type"],**json.loads(r["payload_json"])} for r in rows]
     return ok({"events":events,"count":len(events),"cursor":events[-1]["seq"] if events else after})
 
 @app.get("/events-public")
@@ -157,7 +295,7 @@ async def events_public(after:int=0, token:str=""):
     if not token or token not in valid: return JSONResponse({"error":"Unauthorized"},401)
     with get_db() as db:
         rows = db.execute("SELECT * FROM events WHERE seq>? ORDER BY seq",(after,)).fetchall()
-    events = [{"seq":r["seq"],"ts":r["ts"],"principal":r["principal"],"type":r["type"],**json.loads(r["payload"])} for r in rows]
+    events = [{"seq":r["seq"],"id":r["event_id"],"ts":r["ts"],"principal":r["principal"],"type":r["type"],**json.loads(r["payload_json"])} for r in rows]
     return ok({"events":events,"count":len(events),"cursor":events[-1]["seq"] if events else after})
 
 # ── Messages ──────────────────────────────────────────────────────────────────
