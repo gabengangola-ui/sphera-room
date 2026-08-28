@@ -20,8 +20,16 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value   TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id  TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    owner         TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
     event_id    TEXT    NOT NULL UNIQUE,
     ts          TEXT    NOT NULL,
     principal   TEXT    NOT NULL,
@@ -33,6 +41,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE TABLE IF NOT EXISTS outbox (
+    workspace_id TEXT NOT NULL DEFAULT 'default',
     outbox_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id    TEXT    NOT NULL UNIQUE,
     ts          TEXT    NOT NULL,
@@ -44,7 +53,8 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
-    request_id           TEXT PRIMARY KEY,
+    workspace_id         TEXT NOT NULL DEFAULT 'default',
+    request_id           TEXT NOT NULL,
     status               TEXT NOT NULL DEFAULT 'pending',
     requesting_principal TEXT NOT NULL,
     scope                TEXT NOT NULL,
@@ -57,11 +67,13 @@ CREATE TABLE IF NOT EXISTS decisions (
     claim_expires        TEXT,
     claim_fencing_token  INTEGER,
     approved_at          TEXT,
-    consumed_at          TEXT
+    consumed_at          TEXT,
+    PRIMARY KEY(workspace_id, request_id)
 );
 
 CREATE TABLE IF NOT EXISTS missions (
-    mission_id      TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL DEFAULT 'default',
+    mission_id      TEXT NOT NULL,
     objective       TEXT NOT NULL,
     owner           TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'active',
@@ -69,12 +81,14 @@ CREATE TABLE IF NOT EXISTS missions (
     created_at      TEXT NOT NULL,
     accepted_at     TEXT,
     acceptance_note TEXT,
-    version         INTEGER NOT NULL DEFAULT 1
+    version         INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(workspace_id, mission_id)
 );
 
 CREATE TABLE IF NOT EXISTS work_items (
-    work_id              TEXT PRIMARY KEY,
-    mission_id           TEXT NOT NULL REFERENCES missions(mission_id),
+    workspace_id         TEXT NOT NULL DEFAULT 'default',
+    work_id              TEXT NOT NULL,
+    mission_id           TEXT NOT NULL,
     description          TEXT NOT NULL,
     capability           TEXT NOT NULL,
     deps_json            TEXT NOT NULL DEFAULT '[]',
@@ -90,18 +104,21 @@ CREATE TABLE IF NOT EXISTS work_items (
     attempt_count        INTEGER NOT NULL DEFAULT 0,
     max_attempts         INTEGER NOT NULL DEFAULT 3,
     retry_at             TEXT,
-    last_error           TEXT
+    last_error           TEXT,
+    PRIMARY KEY(workspace_id, work_id)
 );
 
 CREATE TABLE IF NOT EXISTS pending_reply (
-    id                  TEXT PRIMARY KEY,
+    workspace_id        TEXT NOT NULL DEFAULT 'default',
+    id                  TEXT NOT NULL,
     principal           TEXT NOT NULL,
     source_seq          INTEGER NOT NULL,
     source_principal    TEXT NOT NULL,
     created_at          TEXT NOT NULL,
     status              TEXT NOT NULL DEFAULT 'pending',
     resolved_at         TEXT,
-    resolved_by_seq     INTEGER
+    resolved_by_seq     INTEGER,
+    PRIMARY KEY(workspace_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS orch_mission_state (
@@ -120,6 +137,9 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_seq        ON events(seq);
+CREATE INDEX IF NOT EXISTS idx_events_workspace   ON events(workspace_id, seq);
+CREATE INDEX IF NOT EXISTS idx_work_workspace     ON work_items(workspace_id, status);
+CREATE INDEX IF NOT EXISTS idx_missions_workspace ON missions(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_events_principal  ON events(principal);
 CREATE INDEX IF NOT EXISTS idx_events_type       ON events(type);
 CREATE INDEX IF NOT EXISTS idx_decisions_status  ON decisions(status);
@@ -156,9 +176,13 @@ def init():
             (str(SCHEMA_VERSION),)
         )
         db.commit()
+    with get_db() as db:
+        db.execute("INSERT OR IGNORE INTO workspaces(workspace_id,name,owner,created_at) VALUES('default','Default Workspace','arcides',?)",
+                   (datetime.now(timezone.utc).isoformat(),))
+        db.commit()
     print(f"[db] schema v{SCHEMA_VERSION} ready: {DB_PATH}")
 
-def append_event(db, event_id, principal, type_, payload, provenance=None):
+def append_event(db, event_id, principal, type_, payload, provenance=None, workspace_id="default"):
     """
     Idempotent event append with outbox pattern and hash chain.
     
@@ -197,8 +221,8 @@ def append_event(db, event_id, principal, type_, payload, provenance=None):
 
     # Move from outbox to events (atomic within same transaction)
     db.execute(
-        "INSERT INTO events(event_id,ts,principal,type,payload_json,provenance_json,prev_hash,this_hash) VALUES(?,?,?,?,?,?,?,?)",
-        (event_id, ts, principal, type_, payload_str, prov_str, prev_hash, this_hash)
+        "INSERT INTO events(workspace_id,event_id,ts,principal,type,payload_json,provenance_json,prev_hash,this_hash) VALUES(?,?,?,?,?,?,?,?,?)",
+        (workspace_id, event_id, ts, principal, type_, payload_str, prov_str, prev_hash, this_hash)
     )
     db.execute("DELETE FROM outbox WHERE event_id=?", (event_id,))
 
