@@ -128,7 +128,8 @@ async def lifespan(app: FastAPI):
 
     # Start orchestrator as background thread
     try:
-        import threading as _threading
+        import threading as _threading, sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
         from orchestrator import Orchestrator as _Orch
         _orch = _Orch()
         _orch_thread = _threading.Thread(target=_orch.run, daemon=True)
