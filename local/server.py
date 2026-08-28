@@ -551,7 +551,7 @@ async def approve_decision(rid:str, req:Request, authorization:str=Header(defaul
 async def list_decisions(authorization:str=Header(default="")):
     auth(authorization)
     with get_db() as db:
-        rows=db.execute("SELECT * FROM decisions ORDER BY seq DESC").fetchall()
+        rows=db.execute("SELECT * FROM decisions ORDER BY rowid DESC").fetchall()
     return ok({"decisions":[dict(r) for r in rows]})
 
 @app.get("/orch/state")
