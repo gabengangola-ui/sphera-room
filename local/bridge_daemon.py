@@ -114,7 +114,7 @@ def gmail_fetch_new(cursor):
             cursor["uidvalidity"] = uidvalidity
             cursor["last_uid"]    = 0
         # Fetch UIDs > last known
-        _, uid_data = M.uid("SEARCH", None, "ALL")
+        _, uid_data = M.uid("SEARCH", None, "SINCE", "27-Aug-2026")
         all_uids = uid_data[0].split() if uid_data[0] else []
         new_uids = [u for u in all_uids if int(u) > cursor["last_uid"]]
         for uid_b in new_uids:
