@@ -86,7 +86,31 @@ CREATE TABLE IF NOT EXISTS work_items (
     result_seq           INTEGER,
     result_summary       TEXT,
     created_at           TEXT NOT NULL,
-    version              INTEGER NOT NULL DEFAULT 1
+    version              INTEGER NOT NULL DEFAULT 1,
+    attempt_count        INTEGER NOT NULL DEFAULT 0,
+    max_attempts         INTEGER NOT NULL DEFAULT 3,
+    retry_at             TEXT,
+    last_error           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pending_reply (
+    id                  TEXT PRIMARY KEY,
+    principal           TEXT NOT NULL,
+    source_seq          INTEGER NOT NULL,
+    source_principal    TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    resolved_at         TEXT,
+    resolved_by_seq     INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS orch_mission_state (
+    mission_id          TEXT PRIMARY KEY,
+    last_progress_at    TEXT,
+    stalled_since       TEXT,
+    stall_count         INTEGER NOT NULL DEFAULT 0,
+    next_principal      TEXT,
+    status              TEXT NOT NULL DEFAULT 'active'
 );
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
