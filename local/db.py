@@ -176,7 +176,39 @@ def init():
             (str(SCHEMA_VERSION),)
         )
         db.commit()
+    # Add missing columns to existing tables (idempotent via try/except)
+    _add_columns = [
+        ("events",        "workspace_id TEXT NOT NULL DEFAULT 'default'"),
+        ("outbox",        "workspace_id TEXT NOT NULL DEFAULT 'default'"),
+        ("decisions",     "workspace_id TEXT NOT NULL DEFAULT 'default'"),
+        ("missions",      "workspace_id TEXT NOT NULL DEFAULT 'default'"),
+        ("work_items",    "workspace_id TEXT NOT NULL DEFAULT 'default'"),
+        ("pending_reply", "workspace_id TEXT NOT NULL DEFAULT 'default'"),
+        ("work_items",    "attempt_count INTEGER NOT NULL DEFAULT 0"),
+        ("work_items",    "max_attempts INTEGER NOT NULL DEFAULT 3"),
+        ("work_items",    "retry_at TEXT"),
+        ("work_items",    "last_error TEXT"),
+        ("work_items",    "lease_holder TEXT"),
+        ("work_items",    "lease_fencing_token INTEGER NOT NULL DEFAULT 0"),
+        ("work_items",    "result_summary TEXT"),
+        ("missions",      "policy_json TEXT NOT NULL DEFAULT '{}'"),
+        ("missions",      "accepted_at TEXT"),
+        ("missions",      "acceptance_note TEXT"),
+        ("missions",      "version INTEGER NOT NULL DEFAULT 1"),
+        ("decisions",     "params_json TEXT NOT NULL DEFAULT '{}'"),
+        ("decisions",     "bound_digest TEXT NOT NULL DEFAULT ''"),
+        ("decisions",     "claim_fencing_token INTEGER"),
+        ("decisions",     "version INTEGER NOT NULL DEFAULT 1"),
+        ("decisions",     "approved_at TEXT"),
+        ("decisions",     "consumed_at TEXT"),
+    ]
     with get_db() as db:
+        for table, col_def in _add_columns:
+            col_name = col_def.split()[0]
+            try:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+            except Exception:
+                pass  # Column already exists
         db.execute("INSERT OR IGNORE INTO workspaces(workspace_id,name,owner,created_at) VALUES('default','Default Workspace','arcides',?)",
                    (datetime.now(timezone.utc).isoformat(),))
         db.commit()
