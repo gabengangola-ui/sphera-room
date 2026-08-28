@@ -45,11 +45,21 @@ def get_db():
     return conn
 
 def init_db():
-    """Single entry point for schema — delegates to db.init() + migrate.migrate()."""
-    from db import init as db_init, flush_outbox, get_db as _get_db
+    """Single entry point for schema — migrate first, then db.init()."""
+    import os, sqlite3
     from migrate import migrate
+    from db import init as db_init, flush_outbox, get_db as _get_db
+
+    db_path = os.environ.get("SPHERA_DB", "./sphera.db")
+
+    # Step 1: If DB exists, migrate legacy schema first
+    if os.path.exists(db_path):
+        migrate(db_path)
+
+    # Step 2: Now run db.init() which applies the canonical schema
     db_init()
-    migrate()
+
+    # Step 3: Flush any stuck outbox entries
     with _get_db() as _db:
         flush_outbox(_db)
         _db.commit()
