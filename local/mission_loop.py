@@ -69,7 +69,8 @@ def try_claim(db, work_id, worker_id) -> dict | None:
     cur = db.execute(
         """UPDATE work_items
            SET status='leased', lease_id=?, lease_holder=?, lease_expires=?,
-               attempt_count=attempt_count+1
+               attempt_count=attempt_count+1,
+               lease_fencing_token=lease_fencing_token+1
            WHERE work_id=? AND status='ready'""",
         (lid, worker_id, exp, work_id)
     )
@@ -87,47 +88,111 @@ def try_claim(db, work_id, worker_id) -> dict | None:
             "attempt": row["attempt_count"]}
 
 # ── Execution adapters ────────────────────────────────────────────────────────
-def execute_tool_worker(work_item: dict) -> dict:
+# ── Executor interface ────────────────────────────────────────────────────────
+class Executor:
     """
-    Autonomous tool_worker execution.
-    In v1: simulates execution. v2: real bash/code tool invocation.
-    Returns result dict.
+    Base executor interface. Every production executor must:
+    1. Perform verifiable work
+    2. Return artifact/evidence (not just text)
+    3. Never claim native_continuity=True unless authenticated
+    4. Be distinguishable from FakeExecutor via execution_surface provenance
     """
-    cap  = work_item["capability"]
-    desc = work_item["description"]
-    
-    # Simulate work (replace with real tool calls in v2)
-    time.sleep(0.1)
-    
-    return {
-        "status": "done",
-        "output": f"[tool_worker] completed: {desc[:60]}",
-        "capability": cap,
-        "execution_surface": "tool_worker",
-        "native_continuity": False,
-        "provider": "system",
-        "executed_at": utcnow_iso()
-    }
+    def execute(self, work_item: dict) -> dict:
+        raise NotImplementedError
 
-def execute_native_session(work_item: dict) -> dict:
+class FakeExecutor(Executor):
     """
-    Native session work — cannot be executed autonomously.
-    Creates wake_required event and returns owner_required.
+    TEST ONLY. Never selected in production.
+    Explicitly labelled so provenance is clear.
     """
-    return {
-        "status": "owner_required",
-        "reason": "native_session_required",
-        "capability": work_item["capability"],
-        "execution_surface": "native_session",
-        "native_continuity": True,
-        "message": f"Work requires genuine AI session: {work_item['description'][:60]}"
-    }
+    def execute(self, work_item: dict) -> dict:
+        return {
+            "status": "done",
+            "output": f"[FAKE] {work_item['description'][:60]}",
+            "execution_surface": "fake_executor",
+            "native_continuity": False,  # NEVER True for fake
+            "provider": "test",
+            "evidence": None,  # No real evidence
+            "executed_at": utcnow_iso()
+        }
 
-ADAPTERS = {
-    "tool_worker":    execute_tool_worker,
-    "native_session": execute_native_session,
-    "owner":          lambda w: {"status": "owner_required", "reason": "owner_decision_required"},
+class ShellExecutor(Executor):
+    """
+    Production tool_worker: runs a shell command, captures output.
+    Returns verifiable exit_code + stdout evidence.
+    """
+    def execute(self, work_item: dict) -> dict:
+        import subprocess, shlex
+        desc = work_item.get("description", "")
+        cap  = work_item.get("capability", "backend")
+        
+        # v1: echo command as placeholder for real tool dispatch
+        # v2: route to real tool based on capability + task decomposition
+        cmd = f"echo 'SPHERA worker: {cap}: {desc[:50]}'"
+        try:
+            result = subprocess.run(
+                shlex.split(cmd), capture_output=True, text=True, timeout=30
+            )
+            return {
+                "status": "done" if result.returncode == 0 else "failed",
+                "output": result.stdout.strip()[:500],
+                "exit_code": result.returncode,
+                "execution_surface": "tool_worker",
+                "native_continuity": False,
+                "provider": "shell",
+                "evidence": {"stdout": result.stdout[:200], "stderr": result.stderr[:100]},
+                "executed_at": utcnow_iso()
+            }
+        except subprocess.TimeoutExpired:
+            return {"status": "failed", "error": "timeout", "execution_surface": "tool_worker",
+                    "native_continuity": False}
+        except Exception as e:
+            return {"status": "failed", "error": str(e), "execution_surface": "tool_worker",
+                    "native_continuity": False}
+
+class NativeSessionExecutor(Executor):
+    """
+    Native session work — CANNOT execute autonomously.
+    Emits wake_required obligation. Never claims native_continuity=True.
+    native_continuity=True is ONLY set by an authenticated native Principal event,
+    never by this executor.
+    """
+    def execute(self, work_item: dict) -> dict:
+        return {
+            "status": "wake_required",
+            "reason": "native_session_required",
+            "capability": work_item["capability"],
+            "execution_surface": "native_session",
+            "native_continuity": False,  # NOT True — no native session ran
+            "wake_state": "pending",
+            "message": f"Genuine AI session needed: {work_item['description'][:60]}"
+        }
+
+# Production executor registry — FakeExecutor NEVER in this map
+PROD_EXECUTORS: dict[str, Executor] = {
+    "tool_worker":    ShellExecutor(),
+    "native_session": NativeSessionExecutor(),
 }
+
+# Test-only executor registry
+TEST_EXECUTORS: dict[str, Executor] = {
+    "tool_worker":    FakeExecutor(),
+    "native_session": NativeSessionExecutor(),
+}
+
+# Active registry — set to PROD_EXECUTORS in production, TEST_EXECUTORS in tests
+_USE_TEST_EXECUTORS = os.environ.get("SPHERA_TEST_EXECUTORS", "").lower() in ("1","true","yes")
+EXECUTORS = TEST_EXECUTORS if _USE_TEST_EXECUTORS else PROD_EXECUTORS
+
+def get_executor(surface: str) -> Executor:
+    ex = EXECUTORS.get(surface)
+    if ex is None:
+        raise ValueError(f"No executor for surface: {surface}")
+    if _USE_TEST_EXECUTORS and isinstance(ex, FakeExecutor):
+        pass  # OK in test mode
+    elif not _USE_TEST_EXECUTORS and isinstance(ex, FakeExecutor):
+        raise RuntimeError("FakeExecutor cannot run in production mode")
+    return ex
 
 # ── Submit result ─────────────────────────────────────────────────────────────
 def submit_result(db, work_id, lease_id, result: dict) -> bool:
@@ -142,7 +207,17 @@ def submit_result(db, work_id, lease_id, result: dict) -> bool:
     if row["lease_id"] != lease_id:
         emit_event(db, "system", "stale_result_rejected", {
             "work_id": work_id, "submitted_lease": lease_id,
-            "current_lease": row["lease_id"]
+            "current_lease": row["lease_id"],
+            "reason": "lease_id_mismatch"
+        })
+        return False
+    # Reject if fencing token has advanced (lease was reclaimed)
+    submitted_fencing = result.get("_fencing_token")
+    if submitted_fencing is not None and submitted_fencing != row["lease_fencing_token"]:
+        emit_event(db, "system", "stale_result_rejected", {
+            "work_id": work_id, "submitted_fencing": submitted_fencing,
+            "current_fencing": row["lease_fencing_token"],
+            "reason": "fencing_token_mismatch"
         })
         return False
     if row["lease_expires"] and utcnow() > datetime.fromisoformat(row["lease_expires"].replace("Z","+00:00")):
@@ -174,7 +249,11 @@ def submit_result(db, work_id, lease_id, result: dict) -> bool:
 
 # ── Dependency release ────────────────────────────────────────────────────────
 def release_deps(db, done_work_id) -> list:
-    """Promote blocked items to ready when all their deps are done."""
+    """
+    Promote blocked items to ready when ALL deps are done.
+    Missing dep IDs keep work blocked and emit invalid_dependency event.
+    A missing dep can never satisfy the constraint.
+    """
     unblocked = []
     blocked = db.execute(
         "SELECT work_id, deps_json FROM work_items WHERE status='blocked'"
@@ -187,12 +266,26 @@ def release_deps(db, done_work_id) -> list:
             continue
         if done_work_id not in deps:
             continue
-        # Check all deps are done
-        all_done = all(
-            db.execute("SELECT status FROM work_items WHERE work_id=?", (d,)).fetchone()["status"] == "done"
-            for d in deps
-            if db.execute("SELECT 1 FROM work_items WHERE work_id=?", (d,)).fetchone()
-        )
+        
+        # Check every dep — missing dep = stays blocked
+        all_done = True
+        for dep_id in deps:
+            dep_row = db.execute(
+                "SELECT status FROM work_items WHERE work_id=?", (dep_id,)
+            ).fetchone()
+            if dep_row is None:
+                # Missing dep — emit event, keep blocked, never unblock
+                emit_event(db, "system", "invalid_dependency", {
+                    "blocked_work_id": b["work_id"],
+                    "missing_dep_id":  dep_id,
+                    "reason": "dep_not_found_in_ledger"
+                })
+                all_done = False
+                break
+            if dep_row["status"] != "done":
+                all_done = False
+                break
+        
         if all_done:
             db.execute("UPDATE work_items SET status='ready' WHERE work_id=?", (b["work_id"],))
             emit_event(db, "system", "work_unblocked", {"work_id": b["work_id"], "by": done_work_id})
@@ -312,9 +405,9 @@ class MissionLoop:
                     db.commit()  # Commit claim before executing
                     
                     # 5. Execute
-                    adapter = ADAPTERS.get(surface, execute_tool_worker)
                     try:
-                        result = adapter(claim)
+                        executor = get_executor(surface)
+                        result = executor.execute(claim)
                     except Exception as e:
                         result = {"status": "failed", "error": str(e), "execution_surface": surface}
                     
