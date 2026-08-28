@@ -8,7 +8,7 @@ Soba review fixes:
 5. Single-instance PID lock
 6. Atomic cursor persistence (write temp + rename)
 """
-import fcntl, json, os, sys, time, imaplib, smtplib, email, email.mime.text
+import json, os, sys, time, imaplib, smtplib, email, email.mime.text
 import urllib.request, tempfile
 from datetime import datetime, timezone
 
@@ -22,17 +22,23 @@ CURSOR_FILE = os.environ.get("BRIDGE_CURSOR",  "bridge_cursor.json")
 LOCK_FILE   = os.environ.get("BRIDGE_LOCK",    "bridge.lock")
 MAX_RETRY   = 3
 
-# ── FIX 5: Single-instance PID lock ──────────────────────────────────────────
+# ── FIX 5: Single-instance PID lock (cross-platform) ─────────────────────────
 def acquire_lock():
-    lock_fd = open(LOCK_FILE, "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_fd.write(str(os.getpid()))
-        lock_fd.flush()
-        return lock_fd
-    except OSError:
-        print(f"[bridge] ERROR: another instance is running (lock: {LOCK_FILE}). Exiting.")
-        sys.exit(1)
+    if os.path.exists(LOCK_FILE):
+        try:
+            pid = int(open(LOCK_FILE).read().strip())
+            # Check if process is still running
+            if sys.platform == "win32":
+                import ctypes
+                kernel = ctypes.windll.kernel32
+                h = kernel.OpenProcess(1, False, pid)
+                if h: kernel.CloseHandle(h); print(f"[bridge] ERROR: another instance running (PID {pid})."); sys.exit(1)
+            else:
+                os.kill(pid, 0); print(f"[bridge] ERROR: another instance running (PID {pid})."); sys.exit(1)
+        except (ValueError, OSError):
+            pass  # Stale lock file
+    open(LOCK_FILE, "w").write(str(os.getpid()))
+    return None
 
 # ── FIX 6: Atomic cursor persistence ─────────────────────────────────────────
 def load_cursor():
@@ -248,7 +254,6 @@ def run():
         print("\n[bridge] stopped.")
     finally:
         save_cursor(cursor)
-        lock_fd.close()
         try: os.remove(LOCK_FILE)
         except: pass
 
