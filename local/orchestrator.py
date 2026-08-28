@@ -178,13 +178,20 @@ class Orchestrator:
                         resolve_pending_reply(db, principal, seq)
                     mission_id = payload.get("mission_id")
                     if mission_id:
-                        db.execute(
-                            """INSERT INTO orch_mission_state(workspace_id,mission_id,last_progress_at,status)
-                               VALUES('default',?,?,'active')
-                               ON CONFLICT(workspace_id,mission_id) DO UPDATE SET
-                               last_progress_at=excluded.last_progress_at, stalled_since=NULL, status='active'""",
-                            (mission_id, ev["ts"])
-                        )
+                        existing_ms = db.execute(
+                            "SELECT 1 FROM orch_mission_state WHERE workspace_id='default' AND mission_id=?",
+                            (mission_id,)
+                        ).fetchone()
+                        if existing_ms:
+                            db.execute(
+                                "UPDATE orch_mission_state SET last_progress_at=?, stalled_since=NULL, status='active' WHERE workspace_id='default' AND mission_id=?",
+                                (ev["ts"], mission_id)
+                            )
+                        else:
+                            db.execute(
+                                "INSERT INTO orch_mission_state(workspace_id,mission_id,last_progress_at,status) VALUES('default',?,?,'active')",
+                                (mission_id, ev["ts"])
+                            )
                     if etype in ("message","bridge_message") and principal in SPHERA_PRINCIPALS:
                         addressed = who_is_addressed(payload)
                         if not addressed and principal == "arcides":
