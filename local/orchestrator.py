@@ -103,8 +103,8 @@ def record_pending_reply(db, principal, source_seq, source_principal):
     status = "pending" if native else "native_wake_required"
     rid = uid()
     db.execute(
-        "INSERT INTO pending_reply VALUES(?,?,?,?,?,?,?,?)",
-        (rid, principal, source_seq, source_principal, utcnow_iso(), status, None, None)
+        "INSERT INTO pending_reply(workspace_id,id,principal,source_seq,source_principal,created_at,status,resolved_at,resolved_by_seq) VALUES('default',?,?,?,?,?,?,NULL,NULL)",
+        (rid, principal, source_seq, source_principal, utcnow_iso(), status)
     )
     orch_emit(db, "turn_owed", {
         "principal": principal,
@@ -242,8 +242,8 @@ class Orchestrator:
                 mission_id = payload.get("mission_id")
                 if mission_id:
                     db.execute(
-                        """INSERT INTO orch_mission_state(mission_id, last_progress_at, status)
-                           VALUES(?,?,?) ON CONFLICT(mission_id) DO UPDATE SET
+                        """INSERT INTO orch_mission_state(workspace_id,mission_id, last_progress_at, status)
+                           VALUES('default',?,?,?) ON CONFLICT(mission_id) DO UPDATE SET
                            last_progress_at=excluded.last_progress_at,
                            stalled_since=NULL, status='active'""",
                         (mission_id, ev["ts"], "active")
