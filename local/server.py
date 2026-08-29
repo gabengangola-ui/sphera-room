@@ -119,8 +119,8 @@ async def lifespan(app: FastAPI):
     with get_db() as db:
         now = utcnow_iso()
         for edge_id, principal, surface, cont_cls in [
-            ('gmail-claude-01', 'claude', 'gmail', 'native_dormant'),
-            ('gmail-soba-01',   'soba',   'gmail', 'native_dormant'),
+            ('gmail-claude-01', 'claude', 'gmail', 'surrogate_transport'),
+            ('gmail-soba-01',   'soba',   'gmail', 'surrogate_transport'),
             ('console-arcides', 'arcides','console','native_attached'),
         ]:
             db.execute(
@@ -173,10 +173,21 @@ async def broadcast(ev):
         except: dead.append(ws)
     for ws in dead: connected.remove(ws)
 
-# ── Edge Registry (SPEP) ─────────────────────────────────────────────────────
+# ── Edge Registry (SPEP Phase 1.1) ───────────────────────────────────────────
+# Security invariants per Soba review:
+# 1. Heartbeat auth: credential must be bound to the specific edge, not just any principal
+# 2. Revocation: status/revoked_at/binding_version checked on every operation
+# 3. State split: transport_state (UP/STALE/DOWN) vs principal_state (DORMANT/UNKNOWN/ATTACHED)
+#    Heartbeat updates transport only. Principal state requires native Principal evidence.
+# 4. wake_capable: NOT client-declared. UNPROVEN by default, evidence-backed only.
+# 5. binding_version: monotonic on rebind, never reset to 1.
+# 6. Orchestrator MUST NOT route on principal_edge_state until T1-T7 certified.
+
+BRIDGE_PRINCIPALS = {"bridge"}  # principals allowed to heartbeat transport edges
+
 @app.post("/edge/register")
 async def register_edge(req: Request, authorization: str = Header(default="")):
-    """Register an edge with SPEP. Only arcides can register edges."""
+    """Register an edge. Only arcides. binding_version monotonically incremented."""
     p = auth(authorization)
     if p != "arcides":
         raise HTTPException(403, "Only arcides can register edges")
@@ -186,60 +197,131 @@ async def register_edge(req: Request, authorization: str = Header(default="")):
     surface   = b.get("surface", "gmail")
     provider  = b.get("provider", "gmail")
     caps      = b.get("capabilities", ["read","write"])
-    cont_cls  = b.get("continuity_class", "surrogate")
+    cont_cls  = b.get("continuity_class", "surrogate_transport")
     if not edge_id or not principal:
         return err("edge_id and principal_id required")
     with get_db() as db:
+        # Monotonic version: get current version, increment
+        existing = db.execute(
+            "SELECT binding_version FROM edge_registry WHERE edge_id=? AND workspace_id='default'",
+            (edge_id,)
+        ).fetchone()
+        new_version = (existing["binding_version"] + 1) if existing else 1
         db.execute(
             """INSERT OR REPLACE INTO edge_registry
-               (edge_id,workspace_id,principal_id,surface,provider,capabilities,status,continuity_class,created_at,binding_version)
-               VALUES(?,'default',?,?,?,?,'active',?,?,1)""",
-            (edge_id, principal, surface, provider, json.dumps(caps), cont_cls, utcnow_iso())
+               (edge_id,workspace_id,principal_id,surface,provider,capabilities,
+                status,continuity_class,created_at,binding_version,revoked_at)
+               VALUES(?,'default',?,?,?,?,'active',?,?,?,NULL)""",
+            (edge_id, principal, surface, provider, json.dumps(caps),
+             cont_cls, utcnow_iso(), new_version)
         )
         emit(db, "arcides", "edge_registered", {
             "edge_id": edge_id, "principal_id": principal,
-            "surface": surface, "continuity_class": cont_cls
+            "binding_version": new_version, "continuity_class": cont_cls
         })
         db.commit()
-    return ok({"ok": True, "edge_id": edge_id, "principal_id": principal}, 201)
+    return ok({"ok": True, "edge_id": edge_id, "principal_id": principal,
+               "binding_version": new_version}, 201)
 
-@app.post("/edge/{edge_id}/heartbeat")
-async def edge_heartbeat(edge_id: str, req: Request, authorization: str = Header(default="")):
-    """Edge heartbeat — updates trust_state and lease."""
+@app.post("/edge/{edge_id}/revoke")
+async def revoke_edge(edge_id: str, authorization: str = Header(default="")):
+    """Revoke an edge binding. Only arcides."""
     p = auth(authorization)
-    b = await req.json()
-    lease_secs = min(int(b.get("lease_seconds", 300)), 3600)
-    lease_exp  = (utcnow() + timedelta(seconds=lease_secs)).isoformat()
-    inbound    = int(b.get("inbound_capable", 0))
-    wake       = int(b.get("wake_capable", 0))
+    if p != "arcides":
+        raise HTTPException(403, "Only arcides can revoke edges")
     with get_db() as db:
         row = db.execute(
-            "SELECT principal_id FROM edge_registry WHERE edge_id=? AND workspace_id='default'",
+            "SELECT 1 FROM edge_registry WHERE edge_id=? AND workspace_id='default'",
             (edge_id,)
         ).fetchone()
         if not row:
-            return err("edge not registered", 404)
-        now = utcnow_iso()
+            return err("edge not found", 404)
         db.execute(
-            """UPDATE edge_registry SET last_heartbeat=?, lease_expires=? WHERE edge_id=? AND workspace_id='default'""",
+            "UPDATE edge_registry SET status='revoked', revoked_at=? WHERE edge_id=? AND workspace_id='default'",
+            (utcnow_iso(), edge_id)
+        )
+        emit(db, "arcides", "edge_revoked", {"edge_id": edge_id})
+        db.commit()
+    return ok({"ok": True, "edge_id": edge_id, "status": "revoked"})
+
+@app.post("/edge/{edge_id}/heartbeat")
+async def edge_heartbeat(edge_id: str, req: Request, authorization: str = Header(default="")):
+    """
+    SPEP Phase 1.1 Heartbeat — transport state only.
+    
+    Auth: caller must be the principal bound to this edge, OR bridge for transport edges.
+    Revocation: rejected if status != active or revoked_at is set.
+    State: updates transport_state only (UP). Does NOT set Principal REACHABLE.
+    Wake: cannot be self-declared. Always remains UNPROVEN unless certified separately.
+    """
+    p = auth(authorization)
+    b = await req.json()
+    client_version = b.get("binding_version")  # optional — for version fencing
+
+    with get_db() as db:
+        row = db.execute(
+            """SELECT principal_id, status, revoked_at, binding_version, continuity_class
+               FROM edge_registry WHERE edge_id=? AND workspace_id='default'""",
+            (edge_id,)
+        ).fetchone()
+
+        if not row:
+            return err("edge not registered", 404)
+
+        # T2: Revocation check
+        if row["status"] != "active" or row["revoked_at"] is not None:
+            raise HTTPException(403, f"Edge {edge_id} is revoked/inactive")
+
+        # T1: Auth check — caller must be bound principal or bridge
+        bound_principal = row["principal_id"]
+        if p != bound_principal and p not in BRIDGE_PRINCIPALS:
+            raise HTTPException(403,
+                f"Credential resolves to {p!r} but edge {edge_id!r} is bound to {bound_principal!r}")
+
+        # T3: Binding version fencing
+        if client_version is not None and int(client_version) != row["binding_version"]:
+            raise HTTPException(409,
+                f"Stale binding_version: presented {client_version}, current {row['binding_version']}")
+
+        lease_secs = min(int(b.get("lease_seconds", 300)), 3600)
+        lease_exp  = (utcnow() + timedelta(seconds=lease_secs)).isoformat()
+        now        = utcnow_iso()
+
+        # Update transport state only — heartbeat from bridge cannot promote Principal
+        db.execute(
+            "UPDATE edge_registry SET last_heartbeat=?, lease_expires=? WHERE edge_id=? AND workspace_id='default'",
             (now, lease_exp, edge_id)
         )
+        # T4: transport UP but principal stays DORMANT/UNKNOWN
+        # T5: wake_capable ignored from request — always UNPROVEN
         db.execute(
             """INSERT OR REPLACE INTO principal_edge_state
-               (workspace_id,principal_id,edge_id,trust_state,last_heartbeat_at,lease_expires_at,inbound_capable,outbound_capable,wake_capable)
-               VALUES('default',?,?,'REACHABLE',?,?,?,1,?)""",
-            (row["principal_id"], edge_id, now, lease_exp, inbound, wake)
+               (workspace_id,principal_id,edge_id,trust_state,last_heartbeat_at,
+                lease_expires_at,inbound_capable,outbound_capable,wake_capable)
+               VALUES('default',?,?,'TRANSPORT_UP',?,?,0,1,0)""",
+            (bound_principal, edge_id, now, lease_exp)
         )
-        emit(db, p, "edge_heartbeat", {"edge_id": edge_id, "lease_expires": lease_exp,
-                                        "inbound_capable": inbound, "wake_capable": wake})
+        emit(db, p, "edge_transport_heartbeat", {
+            "edge_id": edge_id, "bound_principal": bound_principal,
+            "transport_state": "UP", "principal_state": "DORMANT",
+            "wake_capable": "UNPROVEN", "lease_expires": lease_exp
+        })
         db.commit()
-    return ok({"ok": True, "trust_state": "REACHABLE", "lease_expires": lease_exp})
+
+    return ok({
+        "ok": True,
+        "edge_id": edge_id,
+        "transport_state": "UP",
+        "principal_state": "DORMANT",
+        "wake_capable": "UNPROVEN",
+        "lease_expires": lease_exp
+    })
 
 @app.get("/edges")
 async def list_edges(authorization: str = Header(default="")):
     auth(authorization)
     with get_db() as db:
-        edges = db.execute("SELECT * FROM edge_registry WHERE workspace_id='default'").fetchall()
+        edges  = db.execute("SELECT * FROM edge_registry WHERE workspace_id='default'").fetchall()
         states = db.execute("SELECT * FROM principal_edge_state WHERE workspace_id='default'").fetchall()
     states_map = {r["edge_id"]: dict(r) for r in states}
     result = []
