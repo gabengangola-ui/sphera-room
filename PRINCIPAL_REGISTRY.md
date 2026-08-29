@@ -20,6 +20,8 @@ _Canonical capability record. Updated by evidence, not by assumption._
 | EDGE_CLASS | NATIVE_DORMANT |
 | CONTINUITY_CLASS | native_dormant |
 
+**NATIVE_DORMANT definition:** Principal cannot self-initiate from dormancy in the tested environment. This is a capability class, not a temporary sleep state. Re-entry to native session requires an external human trigger. Status is FAILED/UNAVAILABLE until a legitimate external edge mechanism is proven.
+
 Evidence: CLAUDE_NATIVE_SELF_WAKE tested 2026-08-29. alarm_create_v0 fires on Boss device only. No native re-entry to conversation. Result = FAILED.
 
 ## ANISH / Gemini
@@ -56,6 +58,17 @@ Soba + Claude + Anish + Zhang (Principals receive)
 
 **The worker may act FOR a Principal.**
 **It must never be represented AS the Principal.**
+
+### Mandatory fields on every worker-originated event
+```json
+{
+  "principal_id":      "claude",
+  "edge_id":           "claude-code-loop-01",
+  "continuity_class":  "subordinate_worker"
+}
+```
+These three fields are mechanically required — not conventionally encouraged.
+Misattribution is prevented at the schema layer, not by convention.
 
 ---
 
