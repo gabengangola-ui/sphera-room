@@ -142,10 +142,65 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[sphera] outbox flush warning: {e}")
 
+    # Start reconcile_missions background thread
+    try:
+        import threading as _t2, os as _os2
+        import sys as _sys2; _sys2.path.insert(0, _os2.path.dirname(_os2.path.abspath(__file__)))
+
+        def _reconcile_loop():
+            import time as _time
+            poll = int(_os2.environ.get("RECONCILE_POLL","30"))
+            while True:
+                try:
+                    with get_db() as _db:
+                        missions = _db.execute(
+                            "SELECT mission_id FROM missions WHERE workspace_id='default' AND status='active'"
+                        ).fetchall()
+                    for m in missions:
+                        mid = m["mission_id"]
+                        # Reclaim stale leases
+                        now = utcnow_iso()
+                        with get_db() as _db:
+                            stale = _db.execute(
+                                "SELECT work_id, lease_fencing_token FROM work_items WHERE workspace_id='default' AND mission_id=? AND status='leased' AND lease_expires<?",
+                                (mid, now)
+                            ).fetchall()
+                            for s in stale:
+                                _db.execute(
+                                    "UPDATE work_items SET status='ready', lease_id=NULL, lease_holder=NULL, lease_expires=NULL, lease_fencing_token=lease_fencing_token+1 WHERE workspace_id='default' AND work_id=?",
+                                    (s["work_id"],)
+                                )
+                                emit(_db, "system", "lease_expired_reclaimed", {"work_id": s["work_id"]})
+                            # Unblock deps
+                            done_ids = [r["work_id"] for r in _db.execute(
+                                "SELECT work_id FROM work_items WHERE workspace_id='default' AND mission_id=? AND status='done'",(mid,)
+                            ).fetchall()]
+                            blocked = _db.execute(
+                                "SELECT work_id, deps_json FROM work_items WHERE workspace_id='default' AND mission_id=? AND status='blocked'",(mid,)
+                            ).fetchall()
+                            for b in blocked:
+                                try:
+                                    deps = json.loads(b["deps_json"] or "[]")
+                                    if all(d in done_ids for d in deps):
+                                        _db.execute("UPDATE work_items SET status='ready' WHERE workspace_id='default' AND work_id=?",(b["work_id"],))
+                                        emit(_db, "system", "work_unblocked", {"work_id": b["work_id"]})
+                                except Exception:
+                                    pass
+                            _db.commit()
+                except Exception as _e:
+                    print(f"[reconcile] error: {_e}")
+                _time.sleep(poll)
+
+        _rt = _t2.Thread(target=_reconcile_loop, daemon=True)
+        _rt.start()
+        print("[sphera] reconcile_missions running")
+    except Exception as e:
+        print(f"[sphera] reconcile warning: {e}")
+
     # Start orchestrator as background thread
     try:
         import threading as _threading, sys as _sys, os as _os
-        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import sys as _sys2; _sys2.path.insert(0, _os2.path.dirname(_os2.path.abspath(__file__)))
         from orchestrator import Orchestrator as _Orch
         _orch = _Orch()
         _orch_thread = _threading.Thread(target=_orch.run, daemon=True)
