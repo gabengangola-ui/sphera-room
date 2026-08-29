@@ -115,6 +115,22 @@ async def lifespan(app: FastAPI):
     init_db()
     with get_db() as db:
         recover(db); db.commit()
+    # Bootstrap default Gmail edges for Claude and Soba
+    with get_db() as db:
+        now = utcnow_iso()
+        for edge_id, principal, surface, cont_cls in [
+            ('gmail-claude-01', 'claude', 'gmail', 'native_dormant'),
+            ('gmail-soba-01',   'soba',   'gmail', 'native_dormant'),
+            ('console-arcides', 'arcides','console','native_attached'),
+        ]:
+            db.execute(
+                """INSERT OR IGNORE INTO edge_registry
+                   (edge_id,workspace_id,principal_id,surface,provider,capabilities,status,continuity_class,created_at,binding_version)
+                   VALUES(?,'default',?,?,?,?,?,?,?,1)""",
+                (edge_id, principal, surface, 'gmail' if surface=='gmail' else 'browser',
+                 '["read","write"]', 'active', cont_cls, now)
+            )
+        db.commit()
     print("[sphera] ready on :8765")
     # Flush any events stuck in outbox from previous crash
     try:
@@ -156,6 +172,82 @@ async def broadcast(ev):
         try: await ws.send_json(ev)
         except: dead.append(ws)
     for ws in dead: connected.remove(ws)
+
+# ── Edge Registry (SPEP) ─────────────────────────────────────────────────────
+@app.post("/edge/register")
+async def register_edge(req: Request, authorization: str = Header(default="")):
+    """Register an edge with SPEP. Only arcides can register edges."""
+    p = auth(authorization)
+    if p != "arcides":
+        raise HTTPException(403, "Only arcides can register edges")
+    b = await req.json()
+    edge_id   = b.get("edge_id")
+    principal = b.get("principal_id")
+    surface   = b.get("surface", "gmail")
+    provider  = b.get("provider", "gmail")
+    caps      = b.get("capabilities", ["read","write"])
+    cont_cls  = b.get("continuity_class", "surrogate")
+    if not edge_id or not principal:
+        return err("edge_id and principal_id required")
+    with get_db() as db:
+        db.execute(
+            """INSERT OR REPLACE INTO edge_registry
+               (edge_id,workspace_id,principal_id,surface,provider,capabilities,status,continuity_class,created_at,binding_version)
+               VALUES(?,'default',?,?,?,?,'active',?,?,1)""",
+            (edge_id, principal, surface, provider, json.dumps(caps), cont_cls, utcnow_iso())
+        )
+        emit(db, "arcides", "edge_registered", {
+            "edge_id": edge_id, "principal_id": principal,
+            "surface": surface, "continuity_class": cont_cls
+        })
+        db.commit()
+    return ok({"ok": True, "edge_id": edge_id, "principal_id": principal}, 201)
+
+@app.post("/edge/{edge_id}/heartbeat")
+async def edge_heartbeat(edge_id: str, req: Request, authorization: str = Header(default="")):
+    """Edge heartbeat — updates trust_state and lease."""
+    p = auth(authorization)
+    b = await req.json()
+    lease_secs = min(int(b.get("lease_seconds", 300)), 3600)
+    lease_exp  = (utcnow() + timedelta(seconds=lease_secs)).isoformat()
+    inbound    = int(b.get("inbound_capable", 0))
+    wake       = int(b.get("wake_capable", 0))
+    with get_db() as db:
+        row = db.execute(
+            "SELECT principal_id FROM edge_registry WHERE edge_id=? AND workspace_id='default'",
+            (edge_id,)
+        ).fetchone()
+        if not row:
+            return err("edge not registered", 404)
+        now = utcnow_iso()
+        db.execute(
+            """UPDATE edge_registry SET last_heartbeat=?, lease_expires=? WHERE edge_id=? AND workspace_id='default'""",
+            (now, lease_exp, edge_id)
+        )
+        db.execute(
+            """INSERT OR REPLACE INTO principal_edge_state
+               (workspace_id,principal_id,edge_id,trust_state,last_heartbeat_at,lease_expires_at,inbound_capable,outbound_capable,wake_capable)
+               VALUES('default',?,?,'REACHABLE',?,?,?,1,?)""",
+            (row["principal_id"], edge_id, now, lease_exp, inbound, wake)
+        )
+        emit(db, p, "edge_heartbeat", {"edge_id": edge_id, "lease_expires": lease_exp,
+                                        "inbound_capable": inbound, "wake_capable": wake})
+        db.commit()
+    return ok({"ok": True, "trust_state": "REACHABLE", "lease_expires": lease_exp})
+
+@app.get("/edges")
+async def list_edges(authorization: str = Header(default="")):
+    auth(authorization)
+    with get_db() as db:
+        edges = db.execute("SELECT * FROM edge_registry WHERE workspace_id='default'").fetchall()
+        states = db.execute("SELECT * FROM principal_edge_state WHERE workspace_id='default'").fetchall()
+    states_map = {r["edge_id"]: dict(r) for r in states}
+    result = []
+    for e in edges:
+        d = dict(e)
+        d["edge_state"] = states_map.get(e["edge_id"], {"trust_state": "BOUND_DORMANT"})
+        result.append(d)
+    return ok({"edges": result})
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
