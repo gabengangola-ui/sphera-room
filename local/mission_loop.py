@@ -234,7 +234,7 @@ def submit_result(db, work_id, lease_id, result: dict) -> bool:
     db.execute(
         """UPDATE work_items SET status=?, result_summary=?, result_seq=?,
            lease_id=NULL, lease_holder=NULL, lease_expires=NULL
-           WHERE work_id=?""",
+           WHERE workspace_id='default' AND work_id=?""",
         (status if status in ("done","owner_required","failed") else "done",
          result_json, seq, work_id)
     )
@@ -256,7 +256,7 @@ def release_deps(db, done_work_id) -> list:
     """
     unblocked = []
     blocked = db.execute(
-        "SELECT work_id, deps_json FROM work_items WHERE status='blocked'"
+        "SELECT work_id, deps_json FROM work_items WHERE workspace_id='default' AND status='blocked'"
     ).fetchall()
     
     for b in blocked:
@@ -322,13 +322,13 @@ def schedule_retry(db, work_id, error: str, attempt: int):
 def reclaim_stale_leases(db) -> int:
     now = utcnow_iso()
     stale = db.execute(
-        "SELECT work_id, lease_fencing_token, attempt_count FROM work_items WHERE status='leased' AND lease_expires<?",
+        "SELECT work_id, lease_fencing_token, attempt_count FROM work_items WHERE workspace_id='default' AND status='leased' AND lease_expires<?",
         (now,)
     ).fetchall()
     for s in stale:
         new_fence = s["lease_fencing_token"] + 1
         db.execute(
-            "UPDATE work_items SET status='ready', lease_id=NULL, lease_holder=NULL, lease_expires=NULL, lease_fencing_token=? WHERE work_id=?",
+            "UPDATE work_items SET status='ready', lease_id=NULL, lease_holder=NULL, lease_expires=NULL, lease_fencing_token=? WHERE workspace_id='default' AND work_id=?",
             (new_fence, s["work_id"])
         )
         emit_event(db, "system", "lease_expired_reclaimed", {
@@ -340,7 +340,7 @@ def reclaim_stale_leases(db) -> int:
 def promote_retries(db) -> int:
     now = utcnow_iso()
     due = db.execute(
-        "SELECT work_id FROM work_items WHERE retry_at IS NOT NULL AND retry_at<=? AND status='ready'",
+        "SELECT work_id FROM work_items WHERE workspace_id='default' AND retry_at IS NOT NULL AND retry_at<=? AND status='ready'",
         (now,)
     ).fetchall()
     # They're already ready — just clear the retry_at marker
@@ -374,7 +374,7 @@ class MissionLoop:
                 # 3. Find ready work (exclude items with future retry_at)
                 now = utcnow_iso()
                 ready = db.execute(
-                    "SELECT * FROM work_items WHERE status='ready' AND (retry_at IS NULL OR retry_at<=?) ORDER BY created_at LIMIT 10",
+                    "SELECT * FROM work_items WHERE workspace_id='default' AND status='ready' AND (retry_at IS NULL OR retry_at<=?) ORDER BY created_at LIMIT 10",
                     (now,)
                 ).fetchall()
                 
