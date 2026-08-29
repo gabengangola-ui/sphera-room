@@ -704,7 +704,7 @@ async def req_decision(req:Request, authorization:str=Header(default="")):
     dg=digest(scope,target,p,params); rid=uid()
     with get_db() as db:
         seq=emit(db,p,"decision_requested",{"request_id":rid,"scope":scope,"target":target,"params":params,"digest":dg})
-        db.execute("INSERT INTO decisions VALUES(?,?,?,?,?,?,?,?,?,?,?)",(rid,"pending",p,scope,target,json.dumps(params),dg,b.get("deadline"),None,None,seq))
+        db.execute("INSERT INTO decisions(request_id,status,requesting_principal,scope,target,params_json,bound_digest,deadline,version,claimed_at,claim_expires,claim_fencing_token,approved_at,consumed_at) VALUES(?,?,?,?,?,?,?,?,1,NULL,NULL,NULL,NULL,NULL)",(rid,"pending",p,scope,target,json.dumps(params),dg,b.get("deadline")))
         db.commit()
     return ok({"ok":True,"request_id":rid,"seq":seq,"digest":dg},201)
 
