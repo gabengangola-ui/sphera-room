@@ -19,6 +19,21 @@ CREATE TABLE IF NOT EXISTS missions (mission_id TEXT NOT NULL, objective TEXT NO
 CREATE TABLE IF NOT EXISTS work_items (work_id TEXT NOT NULL, mission_id TEXT NOT NULL, description TEXT NOT NULL, capability TEXT NOT NULL, deps_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'ready', lease_id TEXT, lease_holder TEXT, lease_expires TEXT, lease_fencing_token INTEGER NOT NULL DEFAULT 0, result_seq INTEGER, result_summary TEXT, created_at TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, attempt_count INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 3, retry_at TEXT, last_error TEXT);
 CREATE TABLE IF NOT EXISTS decisions (request_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', requesting_principal TEXT NOT NULL, scope TEXT NOT NULL, target TEXT NOT NULL, params_json TEXT NOT NULL DEFAULT '{}', bound_digest TEXT NOT NULL DEFAULT '', deadline TEXT, version INTEGER NOT NULL DEFAULT 1, claimed_at TEXT, claim_expires TEXT, claim_fencing_token INTEGER, approved_at TEXT, consumed_at TEXT);
 CREATE TABLE IF NOT EXISTS pending_reply (id TEXT NOT NULL, principal TEXT NOT NULL, source_seq INTEGER NOT NULL, source_principal TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', resolved_at TEXT, resolved_by_seq INTEGER);
+CREATE TABLE IF NOT EXISTS work_obligations (
+    workspace_id    TEXT NOT NULL DEFAULT 'default',
+    work_id         TEXT NOT NULL,
+    assignee        TEXT NOT NULL,
+    next_action     TEXT NOT NULL DEFAULT 'execute',
+    due_at          TEXT,
+    wake_state      TEXT NOT NULL DEFAULT 'not_required',
+    last_progress_at TEXT,
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    blocker_kind    TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, work_id)
+);
+
 CREATE TABLE IF NOT EXISTS orch_mission_state (mission_id TEXT NOT NULL, last_progress_at TEXT, stalled_since TEXT, stall_count INTEGER NOT NULL DEFAULT 0, next_principal TEXT, status TEXT NOT NULL DEFAULT 'active');
 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, filename TEXT NOT NULL, applied_at TEXT NOT NULL);
 
@@ -66,6 +81,7 @@ NEW_COLUMNS = [
     ("decisions",         "workspace_id TEXT NOT NULL DEFAULT 'default'"),
     ("pending_reply",     "workspace_id TEXT NOT NULL DEFAULT 'default'"),
     ("orch_mission_state","workspace_id TEXT NOT NULL DEFAULT 'default'"),
+    ("work_obligations", "workspace_id TEXT NOT NULL DEFAULT 'default'"),
     ("work_items",        "attempt_count INTEGER NOT NULL DEFAULT 0"),
     ("work_items",        "max_attempts INTEGER NOT NULL DEFAULT 3"),
     ("work_items",        "retry_at TEXT"),
