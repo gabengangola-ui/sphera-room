@@ -74,7 +74,7 @@ def who_is_addressed(payload):
 
 def record_pending_reply(db, principal, source_seq, source_principal):
     existing = db.execute(
-        "SELECT id FROM pending_reply WHERE principal=? AND source_seq=? AND status='pending'",
+        "SELECT id FROM pending_reply WHERE workspace_id='default' AND principal=? AND source_seq=? AND status='pending'",
         (principal, source_seq)
     ).fetchone()
     if existing:
@@ -94,13 +94,13 @@ def record_pending_reply(db, principal, source_seq, source_principal):
 def resolve_pending_reply(db, principal, resolved_by_seq):
     db.execute(
         """UPDATE pending_reply SET status='resolved', resolved_at=?, resolved_by_seq=?
-           WHERE principal=? AND status IN ('pending','native_wake_required') AND source_seq < ?""",
+           WHERE workspace_id='default' AND principal=? AND status IN ('pending','native_wake_required') AND source_seq < ?""",
         (utcnow_iso(), resolved_by_seq, principal, resolved_by_seq)
     )
 
 def check_mission_stalls(db):
     missions = db.execute(
-        "SELECT * FROM orch_mission_state WHERE status='active'"
+        "SELECT * FROM orch_mission_state WHERE workspace_id='default' AND status='active'"
     ).fetchall()
     now = utcnow()
     for m in missions:
@@ -113,7 +113,7 @@ def check_mission_stalls(db):
         idle = (now - last_dt).total_seconds()
         if idle > STALL_SECS and not m["stalled_since"]:
             db.execute(
-                "UPDATE orch_mission_state SET stalled_since=?, stall_count=stall_count+1, status='stalled' WHERE mission_id=?",
+                "UPDATE orch_mission_state SET stalled_since=?, stall_count=stall_count+1, status='stalled' WHERE workspace_id='default' AND mission_id=?",
                 (utcnow_iso(), m["mission_id"])
             )
             orch_emit(db, "mission_stalled", {"mission_id": m["mission_id"], "idle_secs": int(idle)})
@@ -121,15 +121,15 @@ def check_mission_stalls(db):
 
 def compute_next_move(db):
     pending = db.execute(
-        "SELECT * FROM pending_reply WHERE status IN ('pending','native_wake_required') ORDER BY created_at"
+        "SELECT * FROM pending_reply WHERE workspace_id='default' AND status IN ('pending','native_wake_required') ORDER BY created_at"
     ).fetchall()
     wake_required = [p["principal"] for p in pending if p["status"]=="native_wake_required"]
     pending_turns = [p["principal"] for p in pending if p["status"]=="pending"]
     stalled = db.execute(
-        "SELECT mission_id, stalled_since FROM orch_mission_state WHERE status='stalled'"
+        "SELECT mission_id, stalled_since FROM orch_mission_state WHERE workspace_id='default' AND status='stalled'"
     ).fetchall()
     try:
-        ready_work = db.execute("SELECT COUNT(*) FROM work_items WHERE status='ready'").fetchone()[0]
+        ready_work = db.execute("SELECT COUNT(*) FROM work_items WHERE workspace_id='default' AND status='ready'").fetchone()[0]
     except Exception:
         ready_work = 0
     next_principal = pending_turns[0] if pending_turns else (wake_required[0] if wake_required else None)
