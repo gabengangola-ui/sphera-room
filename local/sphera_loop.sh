@@ -95,7 +95,7 @@ Start your response with: [claude-code-loop] to identify the source."
       log "Claude Code response generated, posting to room..."
       # Escape for JSON
       ESCAPED=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null)
-      post_message "${RESPONSE:0:500}" > /dev/null
+      post_worker_message "${RESPONSE:0:500}" > /dev/null
       log "Posted to room"
     fi
   fi
