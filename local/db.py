@@ -22,6 +22,35 @@ CREATE TABLE IF NOT EXISTS pending_reply (id TEXT NOT NULL, principal TEXT NOT N
 CREATE TABLE IF NOT EXISTS orch_mission_state (mission_id TEXT NOT NULL, last_progress_at TEXT, stalled_since TEXT, stall_count INTEGER NOT NULL DEFAULT 0, next_principal TEXT, status TEXT NOT NULL DEFAULT 'active');
 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, filename TEXT NOT NULL, applied_at TEXT NOT NULL);
 
+CREATE TABLE IF NOT EXISTS edge_registry (
+    edge_id          TEXT NOT NULL,
+    workspace_id     TEXT NOT NULL DEFAULT 'default',
+    principal_id     TEXT NOT NULL,
+    surface          TEXT NOT NULL,
+    provider         TEXT NOT NULL,
+    capabilities     TEXT NOT NULL DEFAULT '["read","write"]',
+    status           TEXT NOT NULL DEFAULT 'active',
+    continuity_class TEXT NOT NULL DEFAULT 'surrogate',
+    last_heartbeat   TEXT,
+    lease_expires    TEXT,
+    binding_version  INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL,
+    revoked_at       TEXT,
+    PRIMARY KEY(workspace_id, edge_id)
+);
+CREATE TABLE IF NOT EXISTS principal_edge_state (
+    workspace_id         TEXT NOT NULL DEFAULT 'default',
+    principal_id         TEXT NOT NULL,
+    edge_id              TEXT NOT NULL,
+    trust_state          TEXT NOT NULL DEFAULT 'BOUND_DORMANT',
+    last_heartbeat_at    TEXT,
+    lease_expires_at     TEXT,
+    inbound_capable      INTEGER NOT NULL DEFAULT 0,
+    outbound_capable     INTEGER NOT NULL DEFAULT 1,
+    wake_capable         INTEGER NOT NULL DEFAULT 0,
+    continuity_evidence  TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(workspace_id, principal_id, edge_id)
+);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_principal ON events(principal);
 CREATE INDEX IF NOT EXISTS idx_work_status ON work_items(status);
