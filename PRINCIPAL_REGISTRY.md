@@ -25,6 +25,26 @@ _Note: EXTERNAL_EDGE_WAKE downgraded from AVAILABLE to UNPROVEN pending SPEP-EDG
 
 **NATIVE_DORMANT definition:** Principal cannot self-initiate from dormancy in the tested environment. This is a capability class, not a temporary sleep state. External human trigger required. FAILED/UNAVAILABLE until legitimate external edge mechanism proven.
 
+
+## BILL / Microsoft Copilot
+| Capability | Status |
+|---|---|
+| EDGE_CLASS | UNCHARACTERISED |
+| NATIVE_WAKE | UNTESTED |
+| EXTERNAL_EDGE_WAKE | UNTESTED |
+| PLATFORM | Microsoft 365 / Copilot |
+| TRANSPORT_SURFACE | UNTESTED |
+
+First task on arrival: edge-characterisation test before any SPHERA development work.
+
+### Edge characterisation protocol (same as Anish)
+- B1: Can Bill reach the probe at sphera-room.duckdns.org/probe directly?
+- B2: Does Copilot have a platform-native scheduled/autonomous wake mechanism?
+- B3: Can Bill use email (Outlook/Gmail) as a SPHERA transport surface?
+- B4: What continuity class is provable — NATIVE_SCHEDULED, NATIVE_DORMANT, or SURROGATE?
+
+Evidence level target: establish E0 minimum, test for E1.
+
 ## ANISH / Gemini
 | Capability | Status |
 |---|---|
