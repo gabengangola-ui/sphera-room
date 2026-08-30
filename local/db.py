@@ -40,6 +40,48 @@ CREATE TABLE IF NOT EXISTS wake_attempt (
     UNIQUE(workspace_id, obligation_id, generation)
 );
 
+CREATE TABLE IF NOT EXISTS wake_attempts (
+    attempt_id           TEXT NOT NULL,
+    workspace_id         TEXT NOT NULL DEFAULT 'default',
+    obligation_id        TEXT NOT NULL,
+    generation           INTEGER NOT NULL DEFAULT 1,
+    target_principal_id  TEXT NOT NULL,
+    target_surface       TEXT NOT NULL,
+    edge_id              TEXT NOT NULL,
+    nonce                TEXT NOT NULL,
+    issued_at            TEXT NOT NULL,
+    expires_at           TEXT NOT NULL,
+    delivery_state       TEXT NOT NULL DEFAULT 'queued',
+    delivery_evidence    TEXT,
+    claimed_at           TEXT,
+    delivered_at         TEXT,
+    PRIMARY KEY(workspace_id, attempt_id),
+    UNIQUE(workspace_id, obligation_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS principal_attestations (
+    attestation_id           TEXT NOT NULL,
+    workspace_id             TEXT NOT NULL DEFAULT 'default',
+    principal_id             TEXT NOT NULL,
+    obligation_id            TEXT NOT NULL,
+    generation               INTEGER NOT NULL,
+    wake_attempt_id          TEXT NOT NULL,
+    attestation_level        TEXT NOT NULL DEFAULT 'L0_CLAIMED',
+    evidence_type            TEXT NOT NULL DEFAULT 'none',
+    connector_edge_id        TEXT,
+    provider_account_binding TEXT,
+    native_surface_binding   TEXT,
+    provider_assertion_ref   TEXT,
+    nonce_echo               TEXT,
+    parent_event_id          TEXT,
+    accepted_at              TEXT,
+    quarantine_reason        TEXT,
+    PRIMARY KEY(workspace_id, attestation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wake_obligation ON wake_attempts(workspace_id, obligation_id, generation);
+CREATE INDEX IF NOT EXISTS idx_attest_obligation ON principal_attestations(workspace_id, obligation_id);
+
 CREATE TABLE IF NOT EXISTS work_obligations (
     workspace_id    TEXT NOT NULL DEFAULT 'default',
     work_id         TEXT NOT NULL,
