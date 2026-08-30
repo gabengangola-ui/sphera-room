@@ -129,6 +129,40 @@ CREATE TABLE IF NOT EXISTS principal_edge_state (
     continuity_evidence  TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(workspace_id, principal_id, edge_id)
 );
+CREATE TABLE IF NOT EXISTS principal_edge_certificates (
+    workspace_id              TEXT NOT NULL DEFAULT 'default',
+    principal_id              TEXT NOT NULL,
+    edge_id                   TEXT NOT NULL,
+    capability                TEXT NOT NULL,
+    result                    TEXT NOT NULL DEFAULT 'UNKNOWN',
+    evidence_event_id         TEXT,
+    verifier_id               TEXT NOT NULL DEFAULT 'system',
+    verifier_class            TEXT NOT NULL DEFAULT 'core',
+    tested_at                 TEXT NOT NULL,
+    expires_at                TEXT,
+    protocol_version          TEXT NOT NULL DEFAULT '1.0',
+    artifact_commit_sha       TEXT,
+    negative_control_event_id TEXT,
+    PRIMARY KEY(workspace_id, principal_id, edge_id, capability, protocol_version)
+);
+
+CREATE TABLE IF NOT EXISTS principal_evidence (
+    workspace_id          TEXT NOT NULL DEFAULT 'default',
+    principal_id          TEXT NOT NULL,
+    edge_id               TEXT NOT NULL,
+    evidence_level        TEXT NOT NULL DEFAULT 'E0',
+    evidence_id           TEXT NOT NULL,
+    verifier_method       TEXT NOT NULL,
+    observed_at           TEXT NOT NULL,
+    expires_at            TEXT,
+    predecessor_evidence_id TEXT,
+    trace_id              TEXT NOT NULL,
+    boss_causal_events    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(workspace_id, principal_id, edge_id, evidence_id),
+    CHECK(evidence_level IN ('E0','E1','E2','E3','E4','REVOKED'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_principal_evidence ON principal_evidence(workspace_id, principal_id, edge_id);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_principal ON events(principal);
 CREATE INDEX IF NOT EXISTS idx_work_status ON work_items(status);
