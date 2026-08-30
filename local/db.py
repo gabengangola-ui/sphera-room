@@ -159,7 +159,7 @@ CREATE TABLE IF NOT EXISTS principal_evidence (
     trace_id              TEXT NOT NULL,
     boss_causal_events    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(workspace_id, principal_id, edge_id, evidence_id),
-    CHECK(evidence_level IN ('E0','E1','E2','E3','E4','REVOKED'))
+    CHECK(evidence_level IN ('E0','E1','E2','E3_R','E3_N','E4','REVOKED'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_principal_evidence ON principal_evidence(workspace_id, principal_id, edge_id);
