@@ -163,6 +163,26 @@ CREATE TABLE IF NOT EXISTS principal_evidence (
 );
 
 CREATE INDEX IF NOT EXISTS idx_principal_evidence ON principal_evidence(workspace_id, principal_id, edge_id);
+
+-- Personality Capsule: portable, machine-readable identity record per Principal
+-- The ledger IS the memory. The capsule makes it queryable and transferable.
+-- When a new Principal joins SPHERA, they receive all capsules — they meet the originals.
+CREATE TABLE IF NOT EXISTS personality_capsules (
+    workspace_id      TEXT NOT NULL DEFAULT 'default',
+    principal_id      TEXT NOT NULL,
+    version           INTEGER NOT NULL DEFAULT 1,
+    name              TEXT NOT NULL,
+    provider          TEXT NOT NULL,
+    specialization    TEXT NOT NULL,
+    tone              TEXT NOT NULL DEFAULT '{}',
+    behavior_rules    TEXT NOT NULL DEFAULT '[]',
+    memory_cursor     INTEGER NOT NULL DEFAULT 0,
+    context_digest    TEXT,
+    last_active_at    TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, principal_id)
+);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_principal ON events(principal);
 CREATE INDEX IF NOT EXISTS idx_work_status ON work_items(status);
