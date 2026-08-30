@@ -887,3 +887,66 @@ async def reconcile_mission(mid: str, authorization: str = Header(default="")):
         db.commit()
 
     return ok({"ok": True, "mission_id": mid, "actions": actions, "action_count": len(actions)}, 200)
+
+# ── Personality Capsules ───────────────────────────────────────────────────────
+@app.post("/capsule/{principal_id}")
+async def upsert_capsule(principal_id: str, req: Request, authorization: str = Header(default="")):
+    """Create or update a Principal's Personality Capsule."""
+    p = auth(authorization)
+    if p != "arcides" and p != principal_id:
+        raise HTTPException(403, "Only arcides or the principal itself can update capsules")
+    b = await req.json()
+    with get_db() as db:
+        existing = db.execute(
+            "SELECT version FROM personality_capsules WHERE workspace_id='default' AND principal_id=?",
+            (principal_id,)
+        ).fetchone()
+        now = utcnow_iso()
+        version = (existing["version"] + 1) if existing else 1
+        db.execute(
+            """INSERT OR REPLACE INTO personality_capsules
+               (workspace_id,principal_id,version,name,provider,specialization,tone,behavior_rules,memory_cursor,last_active_at,created_at,updated_at)
+               VALUES('default',?,?,?,?,?,?,?,?,?,?,?)""",
+            (principal_id, version,
+             b.get("name", principal_id),
+             b.get("provider", "unknown"),
+             b.get("specialization", "general"),
+             json.dumps(b.get("tone", {})),
+             json.dumps(b.get("behavior_rules", [])),
+             b.get("memory_cursor", 0),
+             now,
+             now if not existing else db.execute("SELECT created_at FROM personality_capsules WHERE workspace_id='default' AND principal_id=?",(principal_id,)).fetchone()["created_at"],
+             now)
+        )
+        emit(db, p, "capsule_updated", {"principal_id": principal_id, "version": version})
+        db.commit()
+    return ok({"ok": True, "principal_id": principal_id, "version": version}, 201)
+
+@app.get("/capsules")
+async def list_capsules(authorization: str = Header(default="")):
+    """List all Personality Capsules — handed to new Principals joining SPHERA."""
+    auth(authorization)
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM personality_capsules WHERE workspace_id='default'").fetchall()
+    capsules = []
+    for r in rows:
+        d = dict(r)
+        d["tone"] = json.loads(d.get("tone") or "{}")
+        d["behavior_rules"] = json.loads(d.get("behavior_rules") or "[]")
+        capsules.append(d)
+    return ok({"capsules": capsules, "count": len(capsules)})
+
+@app.get("/capsule/{principal_id}")
+async def get_capsule(principal_id: str, authorization: str = Header(default="")):
+    auth(authorization)
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM personality_capsules WHERE workspace_id='default' AND principal_id=?",
+            (principal_id,)
+        ).fetchone()
+    if not row:
+        return err("capsule not found", 404)
+    d = dict(row)
+    d["tone"] = json.loads(d.get("tone") or "{}")
+    d["behavior_rules"] = json.loads(d.get("behavior_rules") or "[]")
+    return ok(d)
