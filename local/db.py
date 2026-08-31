@@ -164,6 +164,42 @@ CREATE TABLE IF NOT EXISTS principal_evidence (
 
 CREATE INDEX IF NOT EXISTS idx_principal_evidence ON principal_evidence(workspace_id, principal_id, edge_id);
 
+-- Principal Edge Attempt lifecycle table
+-- Replaces the native_wake_required dead-end with a persisted state machine
+-- States: OBLIGATION_CREATED -> EDGE_SELECTED -> CHALLENGE_EMITTED ->
+--         EDGE_OBSERVED -> NATIVE_BINDING_VERIFIED -> RESPONSE_ACCEPTED -> OBLIGATION_RESUMED
+-- Failure states: NO_EDGE, DELIVERY_FAILED, OBSERVATION_TIMEOUT,
+--                 BINDING_FAILED, BOSS_CAUSALITY_PRESENT,
+--                 STALE_OR_REPLAYED_EVIDENCE, BLOCKED_NATIVE_WAKE
+CREATE TABLE IF NOT EXISTS principal_edge_attempts (
+    attempt_id           TEXT NOT NULL,
+    workspace_id         TEXT NOT NULL DEFAULT 'default',
+    work_id              TEXT NOT NULL,
+    mission_id           TEXT NOT NULL,
+    principal_id         TEXT NOT NULL,
+    edge_id              TEXT,
+    state                TEXT NOT NULL DEFAULT 'OBLIGATION_CREATED',
+    challenge_nonce      TEXT,
+    challenge_emitted_at TEXT,
+    observation_event_id TEXT,
+    binding_evidence_id  TEXT,
+    boss_causal_events   INTEGER NOT NULL DEFAULT 0,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    expires_at           TEXT,
+    failure_reason       TEXT,
+    PRIMARY KEY(workspace_id, attempt_id),
+    CHECK(state IN (
+        'OBLIGATION_CREATED','EDGE_SELECTED','CHALLENGE_EMITTED',
+        'EDGE_OBSERVED','NATIVE_BINDING_VERIFIED','RESPONSE_ACCEPTED',
+        'OBLIGATION_RESUMED','NO_EDGE','DELIVERY_FAILED','OBSERVATION_TIMEOUT',
+        'BINDING_FAILED','BOSS_CAUSALITY_PRESENT','STALE_OR_REPLAYED_EVIDENCE',
+        'BLOCKED_NATIVE_WAKE'
+    ))
+);
+CREATE INDEX IF NOT EXISTS idx_pea_work ON principal_edge_attempts(workspace_id, work_id, state);
+CREATE INDEX IF NOT EXISTS idx_pea_principal ON principal_edge_attempts(workspace_id, principal_id, state);
+
 -- Personality Capsule: portable, machine-readable identity record per Principal
 -- The ledger IS the memory. The capsule makes it queryable and transferable.
 -- When a new Principal joins SPHERA, they receive all capsules — they meet the originals.
