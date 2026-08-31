@@ -145,8 +145,9 @@ class FakeAdapter(PrincipalEdgeAdapter):
         return True  # Simulated delivery
 
     def observe_response(self, db, attempt_id, nonce, edge_id):
-        return {"nonce_echo": nonce, "event_seq": str(uuid.uuid4()),
-                "boss_causal_events": 0, "source": "fake"}
+        return {"nonce_echo": nonce, "response_event_id": str(uuid.uuid4()),
+                "boss_causal_events": 0, "source": "fake_test_only",
+                "task_answer": {"fake_result": "test_completed", "adapter": "FakeAdapter"}}
 
     def verify_native_binding(self, db, attempt_id, evidence, nonce, edge_id, work_generation):
         # Write E3_N evidence record for test
@@ -290,6 +291,11 @@ def run_attempt(db, attempt_id: str, adapter: PrincipalEdgeAdapter):
                            "WHERE workspace_id='default' AND work_id=?", (work_id,))
                 return
 
+        # Preserve FULL observed evidence — do not reconstruct later
+        db.execute(
+            "UPDATE principal_edge_attempts SET failure_reason=? WHERE attempt_id=?",
+            (json.dumps({"_observed_evidence": evidence}), attempt_id)
+        )
         cas_transition(db, attempt_id, state, "EDGE_OBSERVED",
                        observation_event_id=obs_event or None)
         state = "EDGE_OBSERVED"
@@ -299,7 +305,12 @@ def run_attempt(db, attempt_id: str, adapter: PrincipalEdgeAdapter):
     if state == "EDGE_OBSERVED":
         nonce    = row["challenge_nonce"]
         edge_id  = row["edge_id"]
-        evidence = {"nonce_echo": nonce}
+        # Use preserved observed evidence — NEVER reconstruct from nonce alone
+        try:
+            preserved = json.loads(row["failure_reason"] or "{}")
+            evidence = preserved.get("_observed_evidence", {"nonce_echo": nonce})
+        except Exception:
+            evidence = {"nonce_echo": nonce}
         # Revalidate edge at verification time
         edge_row = db.execute(
             "SELECT principal_id, status, revoked_at, binding_version FROM edge_registry "
@@ -325,9 +336,60 @@ def run_attempt(db, attempt_id: str, adapter: PrincipalEdgeAdapter):
         cas_transition(db, attempt_id, state, "NATIVE_BINDING_VERIFIED", e3n_evidence_id=e3n_eid)
         state = "NATIVE_BINDING_VERIFIED"
 
-    # NATIVE_BINDING_VERIFIED → RESPONSE_ACCEPTED → OBLIGATION_RESUMED
+    # NATIVE_BINDING_VERIFIED → RESPONSE_VERIFIED → RESPONSE_ACCEPTED → OBLIGATION_RESUMED
+    # E3_N alone cannot release obligation — actual task answer payload required (RESPONSE-BINDING-03)
     if state == "NATIVE_BINDING_VERIFIED":
-        cas_transition(db, attempt_id, state, "RESPONSE_ACCEPTED")
+        attempt_row = db.execute("SELECT failure_reason, challenge_nonce, edge_id FROM principal_edge_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        try:
+            preserved = json.loads(attempt_row["failure_reason"] or "{}")
+            obs_evidence = preserved.get("_observed_evidence", {})
+        except Exception:
+            obs_evidence = {}
+
+        task_payload = obs_evidence.get("task_answer") or obs_evidence.get("payload")
+        if not task_payload:
+            # Valid E3_N but no task answer — native wake cannot satisfy obligation alone
+            cas_transition(db, attempt_id, state, "RESPONSE_MISSING",
+                           "E3_N proven but no task_answer: native wake alone cannot satisfy obligation")
+            db.execute("UPDATE work_items SET status='blocked',waiting_reason='RESPONSE_MISSING' WHERE workspace_id='default' AND work_id=? AND status='waiting_principal_edge'", (work_id,))
+            return
+
+        # Build response artifact using committed schema
+        import hashlib as _hl
+        payload_hash = _hl.sha256(json.dumps(task_payload, sort_keys=True).encode()).hexdigest()
+        artifact_id  = str(uuid.uuid4())
+        nonce_val    = attempt_row["challenge_nonce"]
+        # Look up challenge_artifact_id for this attempt
+        ca = db.execute("SELECT artifact_id FROM challenge_artifacts WHERE workspace_id='default' AND attempt_id=?", (attempt_id,)).fetchone()
+        ca_id = ca["artifact_id"] if ca else "UNKNOWN"
+        # obligation_hash = hash of (work_id, work_gen, principal, edge)
+        ob_hash = _hl.sha256(f"{work_id}:{work_gen}:{principal}:{row['edge_id']}".encode()).hexdigest()[:16]
+        resp_event = obs_evidence.get("response_event_id") or obs_evidence.get("event_seq", "")
+
+        # Replay check
+        if resp_event:
+            dup = db.execute("SELECT 1 FROM response_artifacts WHERE workspace_id='default' AND observation_event_id=?", (str(resp_event),)).fetchone()
+            if dup:
+                cas_transition(db, attempt_id, state, "BINDING_FAILED", f"response_event_id {resp_event} already used")
+                return
+
+        try:
+            db.execute(
+                """INSERT INTO response_artifacts
+                   (artifact_id,workspace_id,attempt_id,challenge_artifact_id,obligation_hash,
+                    nonce_echo,observed_evidence,payload_hash,observation_event_id,
+                    native_binding_proven,response_verified,no_boss_ancestry,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,1,1,1,?)""",
+                (artifact_id,"default",attempt_id,ca_id,ob_hash,
+                 nonce_val,json.dumps(obs_evidence),payload_hash,
+                 str(resp_event) if resp_event else None,utcnow())
+            )
+        except Exception as insert_err:
+            cas_transition(db, attempt_id, state, "BINDING_FAILED", f"artifact insert failed: {insert_err}")
+            return
+
+        cas_transition(db, attempt_id, state, "RESPONSE_VERIFIED")
+        cas_transition(db, attempt_id, "RESPONSE_VERIFIED", "RESPONSE_ACCEPTED")
         # Resume work — CAS against WAITING_PRINCIPAL_EDGE for same generation
         cur = db.execute(
             "UPDATE work_items SET status='ready', waiting_reason=NULL "
@@ -340,7 +402,8 @@ def run_attempt(db, attempt_id: str, adapter: PrincipalEdgeAdapter):
                            "work item generation mismatch at resume")
             return
         cas_transition(db, attempt_id, "RESPONSE_ACCEPTED", "OBLIGATION_RESUMED")
-        print(f"[pea] obligation RESUMED work={work_id[:8]} gen={work_gen}")
+        db.execute("UPDATE principal_edge_attempts SET failure_reason=NULL WHERE attempt_id=?", (attempt_id,))
+        print(f"[pea] obligation RESUMED work={work_id[:8]} gen={work_gen} artifact={artifact_id[:8]}")
 
 
 # ── Reconciler — idempotent, runs on server startup ──────────────────────────
