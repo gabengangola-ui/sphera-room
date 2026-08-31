@@ -177,6 +177,7 @@ CREATE TABLE IF NOT EXISTS principal_edge_attempts (
     work_id              TEXT NOT NULL,
     mission_id           TEXT NOT NULL,
     principal_id         TEXT NOT NULL,
+    work_generation      INTEGER NOT NULL DEFAULT 0,
     edge_id              TEXT,
     state                TEXT NOT NULL DEFAULT 'OBLIGATION_CREATED',
     challenge_nonce      TEXT,
@@ -188,7 +189,10 @@ CREATE TABLE IF NOT EXISTS principal_edge_attempts (
     updated_at           TEXT NOT NULL,
     expires_at           TEXT,
     failure_reason       TEXT,
+    e3n_evidence_id      TEXT,
     PRIMARY KEY(workspace_id, attempt_id),
+    -- Exactly one active attempt per (workspace, work_id, work_generation)
+    UNIQUE(workspace_id, work_id, work_generation),
     CHECK(state IN (
         'OBLIGATION_CREATED','EDGE_SELECTED','CHALLENGE_EMITTED',
         'EDGE_OBSERVED','NATIVE_BINDING_VERIFIED','RESPONSE_ACCEPTED',
@@ -199,6 +203,7 @@ CREATE TABLE IF NOT EXISTS principal_edge_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_pea_work ON principal_edge_attempts(workspace_id, work_id, state);
 CREATE INDEX IF NOT EXISTS idx_pea_principal ON principal_edge_attempts(workspace_id, principal_id, state);
+CREATE INDEX IF NOT EXISTS idx_pea_nonterminal ON principal_edge_attempts(workspace_id, state) WHERE state IN ('OBLIGATION_CREATED','EDGE_SELECTED','CHALLENGE_EMITTED','EDGE_OBSERVED','NATIVE_BINDING_VERIFIED','RESPONSE_ACCEPTED');
 
 -- Personality Capsule: portable, machine-readable identity record per Principal
 -- The ledger IS the memory. The capsule makes it queryable and transferable.
@@ -234,6 +239,9 @@ NEW_COLUMNS = [
     ("decisions",         "workspace_id TEXT NOT NULL DEFAULT 'default'"),
     ("pending_reply",     "workspace_id TEXT NOT NULL DEFAULT 'default'"),
     ("orch_mission_state","workspace_id TEXT NOT NULL DEFAULT 'default'"),
+    ("work_items",        "work_generation INTEGER NOT NULL DEFAULT 0"),
+    ("work_items",        "waiting_reason TEXT"),
+    ("work_items",        "updated_at TEXT"),
     ("work_obligations", "workspace_id TEXT NOT NULL DEFAULT 'default'"),
     ("work_items",        "attempt_count INTEGER NOT NULL DEFAULT 0"),
     ("work_items",        "max_attempts INTEGER NOT NULL DEFAULT 3"),
