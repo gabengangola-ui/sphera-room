@@ -223,6 +223,20 @@ CREATE TABLE IF NOT EXISTS challenge_artifacts (
 );
 
 -- Response artifacts: bind attempt+work+nonce+evidence+payload_hash (RESPONSE-BINDING-03)
+CREATE TABLE IF NOT EXISTS raw_observations (
+    observation_id       TEXT NOT NULL,
+    workspace_id         TEXT NOT NULL DEFAULT 'default',
+    attempt_id           TEXT NOT NULL,
+    challenge_nonce      TEXT NOT NULL,
+    raw_payload          TEXT NOT NULL DEFAULT '{}',
+    nonce_echo           TEXT,
+    response_event_id    TEXT,
+    surface_identifier   TEXT,
+    causal_parent_ref    TEXT,
+    observed_at          TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, observation_id)
+);
+
 CREATE TABLE IF NOT EXISTS response_artifacts (
     artifact_id           TEXT NOT NULL,
     workspace_id          TEXT NOT NULL DEFAULT 'default',
