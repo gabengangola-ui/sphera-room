@@ -416,6 +416,15 @@ class MissionLoop:
                                 "attempt_id": aid, "work_id": work_id,
                                 "capability": cap, "surface": surface
                             })
+                            db.commit()
+                        # Drive the attempt immediately (production path — not test injection)
+                        if aid:
+                            from principal_edge import run_attempt, _TEST_MODE, FakeAdapter, GmailBridgeAdapter
+                            adapter = self._get_pea_adapter(cap, self._principal_for(cap))
+                            if adapter:
+                                with get_db() as _db:
+                                    run_attempt(_db, aid, adapter)
+                                    _db.commit()
                         continue
                     
                     # 4. Atomically claim
