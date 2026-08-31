@@ -196,13 +196,100 @@ CREATE TABLE IF NOT EXISTS principal_edge_attempts (
     CHECK(state IN (
         'OBLIGATION_CREATED','EDGE_SELECTED','CHALLENGE_EMITTED',
         'EDGE_OBSERVED','NATIVE_BINDING_VERIFIED','RESPONSE_ACCEPTED',
-        'OBLIGATION_RESUMED','NO_EDGE','DELIVERY_FAILED','OBSERVATION_TIMEOUT',
+        'RESPONSE_VERIFIED','RESPONSE_ACCEPTED','RESPONSE_MISSING','OBLIGATION_RESUMED','NO_EDGE','DELIVERY_FAILED','OBSERVATION_TIMEOUT',
         'BINDING_FAILED','BOSS_CAUSALITY_PRESENT','STALE_OR_REPLAYED_EVIDENCE',
         'BLOCKED_NATIVE_WAKE'
     ))
 );
 CREATE INDEX IF NOT EXISTS idx_pea_work ON principal_edge_attempts(workspace_id, work_id, state);
 CREATE INDEX IF NOT EXISTS idx_pea_principal ON principal_edge_attempts(workspace_id, principal_id, state);
+-- Challenge artifacts: durable BEFORE transport side effect (PROVENANCE-CAUSALITY-05)
+CREATE TABLE IF NOT EXISTS challenge_artifacts (
+    artifact_id        TEXT NOT NULL,
+    workspace_id       TEXT NOT NULL DEFAULT 'default',
+    attempt_id         TEXT NOT NULL,
+    work_id            TEXT NOT NULL,
+    generation         INTEGER NOT NULL DEFAULT 1,
+    principal_id       TEXT NOT NULL,
+    edge_id            TEXT NOT NULL,
+    binding_version    INTEGER NOT NULL DEFAULT 1,
+    obligation_hash    TEXT NOT NULL,
+    nonce              TEXT NOT NULL,
+    idempotency_key    TEXT NOT NULL UNIQUE,
+    created_at         TEXT NOT NULL,
+    delivered_at       TEXT,
+    delivery_attempts  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(workspace_id, artifact_id)
+);
+
+-- Response artifacts: bind attempt+work+nonce+evidence+payload_hash (RESPONSE-BINDING-03)
+CREATE TABLE IF NOT EXISTS response_artifacts (
+    artifact_id           TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL DEFAULT 'default',
+    attempt_id            TEXT NOT NULL,
+    challenge_artifact_id TEXT NOT NULL,  -- references challenge_artifacts.artifact_id
+    obligation_hash       TEXT NOT NULL,
+    nonce_echo            TEXT NOT NULL,
+    observed_evidence     TEXT NOT NULL DEFAULT '{}',
+    payload_hash          TEXT,
+    observation_event_id  TEXT,
+    native_binding_proven INTEGER NOT NULL DEFAULT 0,
+    response_verified     INTEGER NOT NULL DEFAULT 0,
+    no_boss_ancestry      INTEGER NOT NULL DEFAULT 0,
+    boss_ancestry_derived TEXT,
+    created_at            TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, artifact_id)
+);
+
+-- Principal Route Capabilities: capability contract per {principal_id, edge_id} (ROUTE-CAPABILITY-07)
+CREATE TABLE IF NOT EXISTS principal_route_capabilities (
+    workspace_id                    TEXT NOT NULL DEFAULT 'default',
+    principal_id                    TEXT NOT NULL,
+    edge_id                         TEXT NOT NULL,
+    can_activate_native_session     INTEGER NOT NULL DEFAULT 0,
+    can_deliver_obligation          INTEGER NOT NULL DEFAULT 0,
+    can_observe_native_response     INTEGER NOT NULL DEFAULT 0,
+    can_bind_response               INTEGER NOT NULL DEFAULT 0,
+    can_resume_native_relationship  INTEGER NOT NULL DEFAULT 0,
+    activation_provenance_class     TEXT NOT NULL DEFAULT 'UNKNOWN',
+    human_dependency                TEXT NOT NULL DEFAULT 'UNKNOWN',
+    capability_evidence_id          TEXT,
+    observed_at                     TEXT NOT NULL,
+    expires_at                      TEXT,
+    version                         INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(workspace_id, principal_id, edge_id),
+    CHECK(human_dependency IN ('NONE','OWNER_APPROVAL_ONLY','COURIER','WAKEUP','UNKNOWN')),
+    CHECK(activation_provenance_class IN (
+        'PROVIDER_NATIVE_AUTONOMOUS','EXTERNAL_ACTUATED_NATIVE_SESSION',
+        'SURROGATE_API','TRANSPORT_ONLY','UNKNOWN'
+    ))
+);
+
+-- Activation roots: what caused the native session to activate (ACTIVATION-ROOT-06)
+CREATE TABLE IF NOT EXISTS activation_roots (
+    workspace_id           TEXT NOT NULL DEFAULT 'default',
+    activation_id          TEXT NOT NULL,
+    attempt_id             TEXT NOT NULL,
+    principal_id           TEXT NOT NULL,
+    edge_id                TEXT NOT NULL,
+    actuator_class         TEXT NOT NULL DEFAULT 'unknown',
+    actuator_instance      TEXT,
+    trigger_event_id       TEXT,
+    trigger_origin         TEXT,
+    native_session_binding TEXT,
+    created_at             TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, activation_id),
+    CHECK(actuator_class IN (
+        'provider_native_schedule','provider_native_push',
+        'provider_native_session_resume','external_machine_agent',
+        'manual_human','test_injection','unknown'
+    ))
+);
+
+CREATE INDEX IF NOT EXISTS idx_challenge_attempt ON challenge_artifacts(workspace_id, attempt_id);
+CREATE INDEX IF NOT EXISTS idx_response_challenge ON response_artifacts(workspace_id, challenge_artifact_id);
+CREATE INDEX IF NOT EXISTS idx_route_cap ON principal_route_capabilities(workspace_id, principal_id);
+
 CREATE INDEX IF NOT EXISTS idx_pea_nonterminal ON principal_edge_attempts(workspace_id, state) WHERE state IN ('OBLIGATION_CREATED','EDGE_SELECTED','CHALLENGE_EMITTED','EDGE_OBSERVED','NATIVE_BINDING_VERIFIED','RESPONSE_ACCEPTED');
 
 -- Personality Capsule: portable, machine-readable identity record per Principal
