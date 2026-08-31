@@ -358,6 +358,15 @@ class MissionLoop:
         self.escalated  = 0
         print(f"[mission-loop] {self.worker_id} init")
 
+    def _principal_for(self, capability: str) -> str:
+        """Map capability to the required principal."""
+        return {
+            "security": "claude",
+            "design": "soba",
+            "research": "claude",
+            "decision": "arcides",
+        }.get(capability, "claude")
+
     def tick(self):
         """Single reconciliation pass. Returns number of items processed."""
         processed = 0
@@ -384,16 +393,28 @@ class MissionLoop:
                     surface, autonomous = CAPABILITY_SURFACE.get(cap, ("tool_worker", True))
                     
                     if not autonomous:
-                        # Native session or owner required — emit event, skip
-                        existing = db.execute(
-                            "SELECT 1 FROM events WHERE type='native_wake_required' AND json_extract(payload_json,'$.work_id')=?",
-                            (work_id,)
-                        ).fetchone()
-                        if not existing:
-                            emit_event(db, "system", "native_wake_required", {
-                                "work_id": work_id, "capability": cap,
-                                "execution_surface": surface,
-                                "description": item["description"]
+                        if surface == "owner":
+                            # Owner decision — WAITING_OWNER_AUTHORITY, no PEA attempt
+                            db.execute(
+                                "UPDATE work_items SET status='waiting_owner_authority',"
+                                "waiting_reason='owner_decision_required' "
+                                "WHERE workspace_id='default' AND work_id=?", (work_id,)
+                            )
+                            emit_event(db, "system", "owner_required", {
+                                "work_id": work_id, "reason": "owner_decision_required",
+                                "capability": cap
+                            })
+                            db.commit()
+                            continue
+                        # Native session — create PEA attempt (not a dead-end)
+                        from principal_edge import create_attempt_atomic, _TEST_MODE, FakeAdapter, GmailBridgeAdapter
+                        gen = item["work_generation"] if "work_generation" in item.keys() else 0
+                        aid = create_attempt_atomic(db, work_id, item["mission_id"], self._principal_for(cap), gen)
+                        if aid:
+                            db.commit()
+                            emit_event(db, "system", "edge_attempt_created", {
+                                "attempt_id": aid, "work_id": work_id,
+                                "capability": cap, "surface": surface
                             })
                         continue
                     
