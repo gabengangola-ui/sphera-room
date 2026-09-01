@@ -118,7 +118,18 @@ class PrincipalEdgeAdapter:
 
     def verify_native_binding(self, db, attempt_id: str, evidence: dict,
                               nonce: str, edge_id: str, work_generation: int) -> str | None:
-        """Return E3_N evidence_id or None. Must write principal_evidence record."""
+        """DEPRECATED: use collect_binding_evidence instead. Core verifier writes E3_N."""
+        return None
+
+    def collect_binding_evidence(self, db, attempt_id: str, nonce: str,
+                                  edge_id: str, work_generation: int) -> dict | None:
+        """
+        Collect raw provider/surface binding evidence.
+        Returns dict with raw artifacts (provider_run_id, native_session_id, etc.)
+        or None if no evidence available.
+        MUST NOT include verdict fields or self-attestation of E3_N.
+        Core verifier decides E3_N from this raw evidence.
+        """
         raise NotImplementedError
 
 
