@@ -190,6 +190,8 @@ CREATE TABLE IF NOT EXISTS principal_edge_attempts (
     expires_at           TEXT,
     failure_reason       TEXT,
     e3n_evidence_id      TEXT,
+    activation_root_event_id TEXT,
+    trace_id             TEXT,
     PRIMARY KEY(workspace_id, attempt_id),
     -- Exactly one active attempt per (workspace, work_id, work_generation)
     UNIQUE(workspace_id, work_id, work_generation),
