@@ -325,6 +325,23 @@ CREATE TABLE IF NOT EXISTS personality_capsules (
     updated_at        TEXT NOT NULL,
     PRIMARY KEY(workspace_id, principal_id)
 );
+-- Causal ancestry cache: Core-computed, never adapter-set
+-- Walker traverses causal_parent_event_id chain from response to activation_root
+-- Result: AUTONOMOUS, HUMAN_CAUSAL, UNKNOWN
+CREATE TABLE IF NOT EXISTS causal_ancestry_cache (
+    workspace_id              TEXT NOT NULL DEFAULT 'default',
+    response_event_id         TEXT NOT NULL,
+    attempt_id                TEXT NOT NULL,
+    activation_root_event_id  TEXT NOT NULL,
+    trace_id                  TEXT NOT NULL,
+    ancestry_result           TEXT NOT NULL DEFAULT 'UNKNOWN',
+    human_ancestor_event_id   TEXT,
+    chain_length              INTEGER NOT NULL DEFAULT 0,
+    computed_at               TEXT NOT NULL,
+    ledger_seq_at_compute     INTEGER NOT NULL,
+    PRIMARY KEY(workspace_id, response_event_id, attempt_id),
+    CHECK(ancestry_result IN ('AUTONOMOUS','HUMAN_CAUSAL','UNKNOWN','CYCLE_DETECTED','CHAIN_BROKEN','ROOT_MISMATCH'))
+);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_principal ON events(principal);
 CREATE INDEX IF NOT EXISTS idx_work_status ON work_items(status);
@@ -341,6 +358,13 @@ NEW_COLUMNS = [
     ("pending_reply",     "workspace_id TEXT NOT NULL DEFAULT 'default'"),
     ("orch_mission_state","workspace_id TEXT NOT NULL DEFAULT 'default'"),
     ("work_items",        "work_generation INTEGER NOT NULL DEFAULT 0"),
+    # Causal DAG provenance — required for CAUSAL-DAG-12
+    ("events",            "trace_id TEXT"),
+    ("events",            "causal_parent_event_id TEXT"),
+    ("events",            "activation_root_event_id TEXT"),
+    ("events",            "obligation_id TEXT"),
+    ("events",            "attempt_id TEXT"),
+    ("events",            "work_generation_tag INTEGER"),
     ("work_items",        "waiting_reason TEXT"),
     ("work_items",        "updated_at TEXT"),
     ("work_obligations", "workspace_id TEXT NOT NULL DEFAULT 'default'"),
