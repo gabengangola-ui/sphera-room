@@ -76,8 +76,13 @@ def init_db():
         raise RuntimeError("PROBE_KEY must be set for non-loopback bind. Set env PROBE_KEY=<secret>.")
     print(f"[probe] v1.2 ready | db:{DB_PATH} | key:{'SET' if PROBE_KEY else 'MISSING'}")
 
-@app.on_event("startup")
-async def startup(): init_db()
+from contextlib import asynccontextmanager
+@asynccontextmanager
+async def lifespan(app):
+    init_db()
+    yield
+app = FastAPI(title="SPHERA Probe", version="1.0", lifespan=lifespan)
+def _dummy(): pass  # placeholder
 
 @app.get("/health")
 async def health():
