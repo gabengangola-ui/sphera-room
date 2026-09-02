@@ -56,6 +56,34 @@ def cas_transition(db, attempt_id: str, expected: str, new_state: str,
     return ok
 
 # ── Create attempt — atomic with WAITING_PRINCIPAL_EDGE status ────────────────
+def emit_activation_root(db, attempt_id, work_id, mission_id, principal_id, work_gen):
+    """
+    Emit the causal activation root event for this PEA attempt.
+    Every event in the obligation chain carries causal_parent_event_id pointing
+    back through this root. Core DAG walker uses these links.
+    Returns (activation_root_event_id, trace_id).
+    """
+    import secrets as _sec
+    from datetime import datetime, timezone
+    trace_id = _sec.token_hex(16)
+    root_id  = str(uuid.uuid4())
+    now      = datetime.now(timezone.utc).isoformat()
+    db.execute(
+        """INSERT INTO events
+           (workspace_id,event_id,ts,principal,type,payload_json,provenance_json,
+            prev_hash,this_hash,trace_id,causal_parent_event_id,
+            activation_root_event_id,work_generation_tag,attempt_id,obligation_id)
+           VALUES('default',?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)""",
+        (root_id, now, 'system', 'pea_activation_root',
+         json.dumps({"work_id": work_id, "mission_id": mission_id,
+                     "principal_id": principal_id, "work_generation": work_gen,
+                     "attempt_id": attempt_id}),
+         '{}', '', '',
+         trace_id, root_id, work_gen, attempt_id, attempt_id)
+    )
+    return root_id, trace_id
+
+
 def create_attempt_atomic(db, work_id: str, mission_id: str,
                           principal_id: str, work_generation: int) -> str | None:
     """
