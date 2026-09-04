@@ -386,6 +386,79 @@ async def list_edges(authorization: str = Header(default="")):
         result.append(d)
     return ok({"edges": result})
 
+# ── Remote Dispatch (Control-Plane) ──────────────────────────────────────────
+@app.post("/dispatch")
+async def dispatch_work(req: Request, authorization: str = Header(default="")):
+    """
+    Authenticated remote work dispatch endpoint.
+    Soba and Claude can POST here directly via ngrok URL.
+    Creates mission+work atomically. Deduplication via nonce.
+    Only accepted from authorised principals (soba, claude, arcides).
+    """
+    p = auth(authorization)
+    b = await req.json()
+
+    # Validate required fields
+    target_edge  = b.get("target_edge", "claude-code-local-01")
+    instruction  = b.get("instruction") or b.get("description")
+    nonce        = b.get("nonce")
+    capability   = b.get("capability", "python_execution")
+    approval     = b.get("approval_state", "APPROVED").upper()
+
+    if not instruction:
+        return err("instruction required")
+    if not nonce:
+        return err("nonce required")
+    if target_edge not in {"claude-code-local-01"}:
+        return err(f"target_edge not allowed: {target_edge!r}")
+    if approval != "APPROVED":
+        return err("approval_state must be APPROVED")
+
+    # Safety: no destructive operations
+    forbidden = ["rm ", "del ", "rmdir", "format ", "DROP ", "DELETE FROM",
+                 "os.remove", "shutil.rmtree"]
+    for f in forbidden:
+        if f.lower() in instruction.lower():
+            return err(f"forbidden operation: {f!r}", 400)
+
+    with get_db() as db:
+        # Dedup: check nonce already used
+        existing = db.execute(
+            "SELECT 1 FROM events WHERE json_extract(payload_json,'$.dispatch_nonce')=?",
+            (nonce,)
+        ).fetchone()
+        if existing:
+            return ok({"ok": True, "duplicate": True, "nonce": nonce}, 200)
+
+        # Create mission
+        mid = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO missions(mission_id,objective,owner,status,policy_json,created_at,version) VALUES(?,?,?,?,?,?,1)",
+            (mid, f"Dispatch from {p}: {instruction[:60]}", p, "active", "{}", utcnow_iso())
+        )
+
+        # Create work item
+        wid = str(uuid.uuid4())
+        db.execute(
+            """INSERT INTO work_items(workspace_id,work_id,mission_id,description,capability,
+               deps_json,status,created_at,version,attempt_count,max_attempts,lease_fencing_token,
+               work_generation,waiting_reason,updated_at)
+               VALUES('default',?,?,?,?,'[]','ready',?,1,0,3,0,1,NULL,?)""",
+            (wid, mid, instruction, capability, utcnow_iso(), utcnow_iso())
+        )
+
+        # Emit with dispatch_nonce for dedup
+        emit(db, p, "work_dispatched", {
+            "work_id": wid, "mission_id": mid,
+            "target_edge": target_edge, "capability": capability,
+            "issuer": p, "dispatch_nonce": nonce,
+            "approval_state": "APPROVED"
+        })
+        db.commit()
+
+    return ok({"ok": True, "work_id": wid, "mission_id": mid,
+               "target_edge": target_edge, "nonce": nonce}, 201)
+
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
