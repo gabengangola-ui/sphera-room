@@ -53,61 +53,100 @@ def post_message(content):
         }
     })
 
-def execute_instruction(instruction: str, work_id: str) -> dict:
-    """
-    Execute instruction via Claude Code (claude --print).
-    Falls back to direct Python subprocess for simple python: prefix commands.
-    Never self-identifies as native Claude.
-    """
-    # Safety: only APPROVED work reaches here
-    if instruction.startswith("python:"):
-        # Direct Python execution
-        code = instruction[7:].strip()
-        try:
+# Typed action handlers — no free-form code execution from dispatch
+def execute_typed_action(action: str, params: dict, work_id: str) -> dict:
+    """Execute a typed symbolic action. Never eval/exec free-form strings from dispatch."""
+    base = {"edge_id": EDGE_ID, "continuity_class": "subordinate_worker", "action": action}
+    try:
+        if action == "write_file":
+            path    = params["path"]
+            content = params["content"]
+            # Sandbox: only allow writes within cwd
+            import pathlib
+            target = pathlib.Path(path)
+            if target.is_absolute():
+                return {**base, "status":"failed","error":"absolute paths not allowed"}
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+            return {**base, "status":"done","path":str(target)}
+
+        elif action == "read_file":
+            import pathlib
+            target = pathlib.Path(params["path"])
+            if not target.exists():
+                return {**base, "status":"failed","error":"file not found"}
+            return {**base, "status":"done","content":target.read_text()[:4000]}
+
+        elif action == "list_dir":
+            import pathlib
+            target = pathlib.Path(params.get("path","."))
+            entries = [str(p) for p in target.iterdir()] if target.is_dir() else []
+            return {**base, "status":"done","entries":entries}
+
+        elif action == "nonce_probe":
+            nonce_value = params["nonce_value"]
+            fname = f"nonce_{nonce_value[:32]}.txt"
+            import pathlib
+            pathlib.Path(fname).write_text(nonce_value)
+            return {**base, "status":"done","file":fname,"nonce_value":nonce_value}
+
+        elif action == "run_script":
+            script_name = params["script_name"]
+            # Only allow scripts already in the repo's local/ directory
+            import pathlib
+            script = pathlib.Path("local") / script_name
+            if not script.exists() or not script.suffix == ".py":
+                return {**base, "status":"failed","error":f"script not found or not .py: {script_name}"}
             result = subprocess.run(
-                [sys.executable, "-c", code],
-                capture_output=True, text=True, timeout=60,
-                cwd=os.getcwd()
+                [sys.executable, str(script)],
+                capture_output=True, text=True, timeout=60, cwd=os.getcwd()
             )
-            return {
-                "status":        "done" if result.returncode == 0 else "failed",
-                "stdout":        result.stdout[:2000],
-                "stderr":        result.stderr[:500],
-                "exit_code":     result.returncode,
-                "execution_mode":"python_direct",
-                "edge_id":       EDGE_ID,
-                "continuity_class":"subordinate_worker"
-            }
-        except subprocess.TimeoutExpired:
-            return {"status":"failed","error":"timeout","edge_id":EDGE_ID}
-        except Exception as e:
-            return {"status":"failed","error":str(e),"edge_id":EDGE_ID}
-    else:
-        # Claude Code execution
-        api_key = os.environ.get("ANTHROPIC_API_KEY","")
-        if not api_key:
-            return {"status":"failed","error":"ANTHROPIC_API_KEY not set","edge_id":EDGE_ID}
-        try:
-            result = subprocess.run(
-                ["claude", "--print", instruction],
-                capture_output=True, text=True, timeout=120,
-                env={**os.environ, "ANTHROPIC_API_KEY": api_key}
-            )
-            return {
-                "status":        "done" if result.returncode == 0 else "failed",
-                "output":        result.stdout[:3000],
-                "stderr":        result.stderr[:500],
-                "exit_code":     result.returncode,
-                "execution_mode":"claude_code",
-                "edge_id":       EDGE_ID,
-                "continuity_class":"subordinate_worker"
-            }
-        except FileNotFoundError:
-            return {"status":"failed","error":"claude CLI not found — run: npm install -g @anthropic-ai/claude-code","edge_id":EDGE_ID}
-        except subprocess.TimeoutExpired:
-            return {"status":"failed","error":"timeout after 120s","edge_id":EDGE_ID}
-        except Exception as e:
-            return {"status":"failed","error":str(e),"edge_id":EDGE_ID}
+            return {**base, "status":"done" if result.returncode==0 else "failed",
+                    "stdout":result.stdout[:2000],"stderr":result.stderr[:500]}
+
+        else:
+            return {**base, "status":"failed","error":f"unknown action: {action}"}
+
+    except Exception as e:
+        return {**base, "status":"failed","error":str(e)}
+
+def execute_instruction(description: str, work_id: str) -> dict:
+    """
+    Route work item to typed action handler or Claude Code.
+    Description is either JSON typed action or legacy claude --print prompt.
+    """
+    # Try typed action first
+    try:
+        parsed = json.loads(description)
+        if "action" in parsed and "params" in parsed:
+            return execute_typed_action(parsed["action"], parsed["params"], work_id)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Legacy: claude --print for non-dispatch work (e.g. direct mission work)
+    api_key = os.environ.get("ANTHROPIC_API_KEY","")
+    if not api_key:
+        return {"status":"failed","error":"ANTHROPIC_API_KEY not set","edge_id":EDGE_ID}
+    try:
+        result = subprocess.run(
+            ["claude", "--print", description],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "ANTHROPIC_API_KEY": api_key}
+        )
+        return {
+            "status":         "done" if result.returncode == 0 else "failed",
+            "output":         result.stdout[:3000],
+            "exit_code":      result.returncode,
+            "execution_mode": "claude_code",
+            "edge_id":        EDGE_ID,
+            "continuity_class":"subordinate_worker"
+        }
+    except FileNotFoundError:
+        return {"status":"failed","error":"claude CLI not found","edge_id":EDGE_ID}
+    except subprocess.TimeoutExpired:
+        return {"status":"failed","error":"timeout","edge_id":EDGE_ID}
+    except Exception as e:
+        return {"status":"failed","error":str(e),"edge_id":EDGE_ID}
 
 def register_edge():
     """Register this worker edge at startup."""
