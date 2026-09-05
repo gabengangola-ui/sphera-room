@@ -77,8 +77,11 @@ def parse_northbound(body: str) -> dict | None:
     except Exception:
         return None
 
+# Typed actions only — mirrors server.py DISPATCH_ACTIONS
+NB_ALLOWED_ACTIONS = {"write_file","read_file","list_dir","run_script","nonce_probe"}
+
 def validate_command(cmd: dict) -> tuple[bool, str]:
-    """Validate command envelope. Returns (ok, reason)."""
+    """Validate northbound command envelope. Typed actions only — no free-form instruction."""
     issuer = cmd.get("issuer","").lower()
     if issuer not in AUTHORISED_ISSUERS:
         return False, f"unauthorised issuer: {issuer!r}"
@@ -89,15 +92,15 @@ def validate_command(cmd: dict) -> tuple[bool, str]:
         return False, "approval_state must be APPROVED"
     if not cmd.get("nonce"):
         return False, "nonce required"
-    if not cmd.get("instruction"):
-        return False, "instruction required"
-    # Safety: no destructive actions on first pass
-    instr = cmd.get("instruction","")
-    forbidden = ["rm ", "del ", "rmdir", "format ", "DROP ", "DELETE FROM",
-                 "os.remove", "shutil.rmtree", "subprocess.run"]
-    for f in forbidden:
-        if f.lower() in instr.lower():
-            return False, f"forbidden operation in instruction: {f!r}"
+    # Typed action required — no free-form instruction field
+    action = cmd.get("action","")
+    if not action:
+        return False, "action required (no free-form instruction accepted)"
+    if action not in NB_ALLOWED_ACTIONS:
+        return False, f"unknown action {action!r}. allowed: {sorted(NB_ALLOWED_ACTIONS)}"
+    params = cmd.get("params", {})
+    if not isinstance(params, dict):
+        return False, "params must be a dict"
     return True, "ok"
 
 def inject_work(cmd: dict, seen: set) -> tuple[bool, str]:
@@ -119,10 +122,12 @@ def inject_work(cmd: dict, seen: set) -> tuple[bool, str]:
         if not mission_id:
             return False, f"failed to create mission: {r}"
 
-    # Create work item
+    # Create work item with typed action (serialised as JSON description)
+    import json as _json
+    typed_desc = _json.dumps({"action": cmd.get("action"), "params": cmd.get("params", {})})
     r = room("POST", f"/mission/{mission_id}/work", {
-        "description": cmd.get("instruction",""),
-        "capability":  cmd.get("capability","python_execution"),
+        "description": typed_desc,
+        "capability":  "python_execution",
         "approval_state": "APPROVED",
         "issuer_principal": cmd.get("issuer","soba"),
         "target_edge_id": cmd.get("target_edge","claude-code-local-01"),
