@@ -386,6 +386,17 @@ async def list_edges(authorization: str = Header(default="")):
         result.append(d)
     return ok({"edges": result})
 
+@app.get("/work/ready")
+async def ready_work(capability: str = "python_execution", limit: int = 5,
+                     authorization: str = Header(default="")):
+    auth(authorization)
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT work_id,mission_id,description,capability FROM work_items WHERE workspace_id='default' AND status='ready' AND capability=? LIMIT ?",
+            (capability, limit)
+        ).fetchall()
+    return ok({"items": [dict(r) for r in rows], "count": len(rows)})
+
 # ── Remote Dispatch (Control-Plane) ──────────────────────────────────────────
 @app.post("/dispatch")
 async def dispatch_work(req: Request, authorization: str = Header(default="")):
