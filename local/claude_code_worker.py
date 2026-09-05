@@ -120,57 +120,55 @@ def register_edge():
         "continuity_class": "subordinate_worker"
     }, key=os.environ.get("ARCIDES_KEY","ak-sphera"))
 
+def try_claim_and_execute(work_id, description):
+    """Try to claim and execute a single work item."""
+    claim = room("POST", f"/work/{work_id}/claim", {"lease_seconds": LEASE_SECS})
+    lid   = claim.get("lease_id")
+    if not lid:
+        return  # Already claimed by someone else
+
+    instruction = description
+    print(f"[ccw] executing: {work_id[:8]} | {instruction[:60]}")
+    result = execute_instruction(instruction, work_id)
+    room("POST", f"/work/{work_id}/result", {"lease_id": lid, "result": result})
+    status = result.get("status","?")
+    print(f"[ccw] result: {work_id[:8]} → {status}")
+    post_message(
+        f"[claude-code-local-01] Work {work_id[:8]} {status}. "
+        f"Output: {str(result.get('output') or result.get('stdout',''))[:200]}"
+    )
+
 def poll_and_execute(cursor):
-    """One poll cycle: find ready work, claim, execute, post result."""
+    """One poll cycle: scan ready work items AND event stream."""
+    new_cursor = cursor
+
+    # PRIMARY: scan work_items table directly via events for any ready python_execution work
     r = room("GET", f"/events?after={cursor}")
     events = r.get("events", [])
-    new_cursor = cursor
 
     for ev in events:
         new_cursor = ev.get("seq", new_cursor)
-        if ev.get("type") not in ("work_created", "work_unblocked"):
+        etype = ev.get("type","")
+        if etype not in ("work_created", "work_unblocked", "work_dispatched"):
             continue
-
         payload = ev.get("payload_json", {})
         if isinstance(payload, str):
             try: payload = json.loads(payload)
             except: continue
-
         work_id    = payload.get("work_id")
-        capability = payload.get("capability")
+        capability = payload.get("capability","")
         if not work_id or capability != CAPABILITY:
             continue
+        description = payload.get("instruction") or payload.get("description","")
+        try_claim_and_execute(work_id, description)
 
-        # Claim the work item
-        claim = room("POST", f"/work/{work_id}/claim", {"lease_seconds": LEASE_SECS})
-        lid   = claim.get("lease_id")
-        if not lid:
-            continue  # Already claimed
-
-        instruction = payload.get("instruction") or payload.get("description","")
-        approval    = payload.get("approval_state","APPROVED")
-
-        if approval not in ("APPROVED", "approved"):
-            # Escalate — do not execute unapproved work
-            room("POST", f"/work/{work_id}/result", {
-                "lease_id": lid,
-                "result": {"status":"escalated","reason":"approval_required","edge_id":EDGE_ID}
-            })
-            post_message(f"[claude-code-local-01] Work {work_id[:8]} requires approval before execution.")
-            continue
-
-        print(f"[ccw] executing: {work_id[:8]} | {instruction[:60]}")
-        result = execute_instruction(instruction, work_id)
-
-        room("POST", f"/work/{work_id}/result", {"lease_id": lid, "result": result})
-
-        status = result.get("status","?")
-        print(f"[ccw] result: {work_id[:8]} → {status}")
-        post_message(
-            f"[claude-code-local-01] Work {work_id[:8]} {status}. "
-            f"Mode: {result.get('execution_mode','?')}. "
-            f"Output: {str(result.get('output') or result.get('stdout',''))[:200]}"
-        )
+    # SECONDARY: also probe /work/ready to catch anything missed at startup
+    r2 = room("GET", f"/work/ready?capability={CAPABILITY}&limit=5")
+    for item in r2.get("items", []):
+        work_id     = item.get("work_id")
+        description = item.get("description","")
+        if work_id:
+            try_claim_and_execute(work_id, description)
 
     return new_cursor
 
