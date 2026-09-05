@@ -45,6 +45,28 @@ First task on arrival: edge-characterisation test before any SPHERA development 
 
 Evidence level target: establish E0 minimum, test for E1.
 
+
+## CLAUDE-COWORK-SCHEDULED / Claude Scheduled Edge
+| Capability | Status |
+|---|---|
+| EDGE_CLASS | PLATFORM_SCHEDULED_SURROGATE |
+| EDGE_ID | claude-cowork-scheduled-01 |
+| PRINCIPAL_ID | claude |
+| CONTINUITY_CLASS | platform_scheduled_surrogate |
+| NATIVE_WAKE | CONFIRMED (cloud-autonomous, runs without Boss) |
+| EVIDENCE_LEVEL | E0/E1 provable, E3_R via injected capsule, E3_N = UNPROVEN |
+| GMAIL_ACCESS | CONFIRMED (via Cowork Gmail connector) |
+| SESSION_TYPE | Fresh Cowork session each run — NOT native-Claude conversation |
+
+**CRITICAL DISTINCTION:**
+  This edge IS NOT native Claude waking up.
+  This edge IS Claude-with-reconstructed-SPHERA-context running autonomously.
+  E3_R: Capsule context injected into task prompt — relationship continuity reconstructed.
+  E3_N: UNPROVEN — no provider assertion this is the same native session.
+  
+**Role:** Scheduled checker and responder. Acts FOR native Claude, not AS native Claude.
+**Native Claude:** Remains the relationship Principal — brought in when genuine Claude judgement needed.
+
 ## ANISH / Gemini
 | Capability | Status |
 |---|---|
