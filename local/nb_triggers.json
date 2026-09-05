@@ -1,0 +1,13 @@
+{
+  "soba-gate-01": {
+    "issuer": "soba",
+    "target_edge": "claude-code-local-01",
+    "mission_id": "55b0b75a-4c3a-43dd-ac01-908a10517f01",
+    "action": "nonce_probe",
+    "params": {
+      "nonce_value": "SOBA_NORTHBOUND_GATE_PASS"
+    },
+    "approval_state": "APPROVED",
+    "nonce": "soba-gate-01"
+  }
+}
