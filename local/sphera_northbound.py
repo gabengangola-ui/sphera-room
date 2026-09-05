@@ -67,8 +67,40 @@ def room(method, path, body=None, key=None):
     except Exception as e:
         return {"error": str(e)}
 
+# Trigger registry file — Boss pre-registers triggers before Soba sends them
+TRIGGER_REGISTRY_FILE = "nb_triggers.json"
+
+def load_triggers():
+    try: return json.load(open(TRIGGER_REGISTRY_FILE))
+    except: return {}
+
+def save_triggers(triggers):
+    tmp = TRIGGER_REGISTRY_FILE + ".tmp"
+    with open(tmp,"w") as f: json.dump(triggers, f, indent=2)
+    os.replace(tmp, TRIGGER_REGISTRY_FILE)
+
 def parse_northbound(body: str) -> dict | None:
-    """Parse SPHERA-NORTHBOUND envelope. Returns parsed dict or None."""
+    """
+    Parse SPHERA-NORTHBOUND envelope OR simple prose trigger.
+    Prose format: 'SPHERA RUN <trigger_key>' anywhere in email body.
+    Trigger key is looked up in nb_triggers.json (pre-registered by Boss or Claude).
+    This allows Soba to send ordinary prose — no JSON envelope needed.
+    """
+    # Try prose trigger first: "SPHERA RUN <key>"
+    import re
+    match = re.search(r'SPHERA RUN ([A-Za-z0-9_-]+)', body)
+    if match:
+        trigger_key = match.group(1)
+        triggers = load_triggers()
+        if trigger_key in triggers:
+            t = triggers[trigger_key]
+            print(f"[nb] prose trigger matched: {trigger_key}")
+            return t
+        else:
+            print(f"[nb] prose trigger {trigger_key!r} not found in registry")
+            return None
+
+    # Try structured envelope
     if "SPHERA-NORTHBOUND" not in body: return None
     try:
         s = body.index("SPHERA-NORTHBOUND") + len("SPHERA-NORTHBOUND")
@@ -114,13 +146,7 @@ def inject_work(cmd: dict, seen: set) -> tuple[bool, str]:
 
     mission_id = cmd.get("mission_id")
     if not mission_id:
-        # Create a mission for this command
-        r = room("POST", "/mission",
-                 {"objective": f"Northbound command from {cmd.get('issuer')}: {cmd.get('instruction','')[:60]}"},
-                 key=ARCIDES_KEY)
-        mission_id = r.get("mission_id")
-        if not mission_id:
-            return False, f"failed to create mission: {r}"
+        return False, "mission_id required — register trigger with mission_id via nb_triggers.json"
 
     # Create work item with typed action (serialised as JSON description)
     import json as _json
