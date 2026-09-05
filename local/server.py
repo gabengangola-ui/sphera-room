@@ -397,78 +397,95 @@ async def ready_work(capability: str = "python_execution", limit: int = 5,
         ).fetchall()
     return ok({"items": [dict(r) for r in rows], "count": len(rows)})
 
-# ── Remote Dispatch (Control-Plane) ──────────────────────────────────────────
+# ── Typed Symbolic Dispatch (Control-Plane) ───────────────────────────────────
+# Allowed actions — never free-form instruction strings
+DISPATCH_ACTIONS = {
+    "write_file":   {"required": ["path", "content"], "capability": "python_execution"},
+    "read_file":    {"required": ["path"],             "capability": "python_execution"},
+    "list_dir":     {"required": ["path"],             "capability": "python_execution"},
+    "run_script":   {"required": ["script_name"],      "capability": "python_execution"},
+    "nonce_probe":  {"required": ["nonce_value"],      "capability": "python_execution"},
+}
+ALLOWED_EDGES = {"claude-code-local-01"}
+
 @app.post("/dispatch")
 async def dispatch_work(req: Request, authorization: str = Header(default="")):
     """
-    Authenticated remote work dispatch endpoint.
-    Soba and Claude can POST here directly via ngrok URL.
-    Creates mission+work atomically. Deduplication via nonce.
-    Only accepted from authorised principals (soba, claude, arcides).
+    Typed symbolic work dispatch. No free-form instruction strings.
+    Caller must supply: action (from DISPATCH_ACTIONS), params, mission_id, nonce.
+    mission_id must reference an existing mission — never auto-created here.
+    Deduplication via nonce (per principal).
+    Allowed principals: soba, claude, arcides.
     """
     p = auth(authorization)
     b = await req.json()
 
-    # Validate required fields
-    target_edge  = b.get("target_edge", "claude-code-local-01")
-    instruction  = b.get("instruction") or b.get("description")
-    nonce        = b.get("nonce")
-    capability   = b.get("capability", "python_execution")
-    approval     = b.get("approval_state", "APPROVED").upper()
+    action      = b.get("action", "")
+    params      = b.get("params", {})
+    mission_id  = b.get("mission_id")
+    nonce       = b.get("nonce", "")
+    target_edge = b.get("target_edge", "claude-code-local-01")
 
-    if not instruction:
-        return err("instruction required")
+    # Validate action type
+    if action not in DISPATCH_ACTIONS:
+        return err(f"unknown action {action!r}. allowed: {sorted(DISPATCH_ACTIONS)}", 400)
+
+    # Validate required params
+    spec = DISPATCH_ACTIONS[action]
+    for req_field in spec["required"]:
+        if not params.get(req_field):
+            return err(f"action {action!r} requires params.{req_field}", 400)
+
+    # mission_id must exist — never auto-create owner missions
+    if not mission_id:
+        return err("mission_id required — create a mission first via POST /mission", 400)
+
     if not nonce:
-        return err("nonce required")
-    if target_edge not in {"claude-code-local-01"}:
-        return err(f"target_edge not allowed: {target_edge!r}")
-    if approval != "APPROVED":
-        return err("approval_state must be APPROVED")
+        return err("nonce required for idempotency", 400)
 
-    # Safety: no destructive operations
-    forbidden = ["rm ", "del ", "rmdir", "format ", "DROP ", "DELETE FROM",
-                 "os.remove", "shutil.rmtree"]
-    for f in forbidden:
-        if f.lower() in instruction.lower():
-            return err(f"forbidden operation: {f!r}", 400)
+    if target_edge not in ALLOWED_EDGES:
+        return err(f"target_edge not allowed: {target_edge!r}", 400)
 
     with get_db() as db:
-        # Dedup: check nonce already used
+        # Verify mission exists
+        mission = db.execute(
+            "SELECT mission_id, status FROM missions WHERE mission_id=? AND workspace_id='default'",
+            (mission_id,)
+        ).fetchone()
+        if not mission:
+            return err(f"mission {mission_id!r} not found", 404)
+        if mission["status"] not in ("active", "pending"):
+            return err(f"mission status is {mission['status']!r} — only active/pending missions accept work", 400)
+
+        # Dedup by nonce per principal
         existing = db.execute(
-            "SELECT 1 FROM events WHERE json_extract(payload_json,'$.dispatch_nonce')=?",
-            (nonce,)
+            "SELECT 1 FROM events WHERE json_extract(payload_json,'$.dispatch_nonce')=? AND principal=?",
+            (nonce, p)
         ).fetchone()
         if existing:
             return ok({"ok": True, "duplicate": True, "nonce": nonce}, 200)
 
-        # Create mission
-        mid = str(uuid.uuid4())
-        db.execute(
-            "INSERT INTO missions(mission_id,objective,owner,status,policy_json,created_at,version) VALUES(?,?,?,?,?,?,1)",
-            (mid, f"Dispatch from {p}: {instruction[:60]}", p, "active", "{}", utcnow_iso())
-        )
+        # Build typed description for the worker
+        description = json.dumps({"action": action, "params": params})
 
-        # Create work item
         wid = str(uuid.uuid4())
         db.execute(
             """INSERT INTO work_items(workspace_id,work_id,mission_id,description,capability,
                deps_json,status,created_at,version,attempt_count,max_attempts,lease_fencing_token,
                work_generation,waiting_reason,updated_at)
                VALUES('default',?,?,?,?,'[]','ready',?,1,0,3,0,1,NULL,?)""",
-            (wid, mid, instruction, capability, utcnow_iso(), utcnow_iso())
+            (wid, mission_id, description, spec["capability"], utcnow_iso(), utcnow_iso())
         )
-
-        # Emit with dispatch_nonce for dedup
         emit(db, p, "work_dispatched", {
-            "work_id": wid, "mission_id": mid,
-            "target_edge": target_edge, "capability": capability,
+            "work_id": wid, "mission_id": mission_id,
+            "target_edge": target_edge, "action": action,
             "issuer": p, "dispatch_nonce": nonce,
             "approval_state": "APPROVED"
         })
         db.commit()
 
-    return ok({"ok": True, "work_id": wid, "mission_id": mid,
-               "target_edge": target_edge, "nonce": nonce}, 201)
+    return ok({"ok": True, "work_id": wid, "mission_id": mission_id,
+               "action": action, "target_edge": target_edge, "nonce": nonce}, 201)
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
