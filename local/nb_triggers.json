@@ -9,5 +9,28 @@
     },
     "approval_state": "APPROVED",
     "nonce": "soba-gate-01"
+  },
+  "final72-audit-01": {
+    "issuer": "soba",
+    "target_edge": "claude-code-local-01",
+    "mission_id": "0f6fffce-4e3d-4179-befb-d442709b580d",
+    "action": "list_dir",
+    "params": {
+      "path": "local"
+    },
+    "approval_state": "APPROVED",
+    "nonce": "final72-audit-01",
+    "_mission_objective": "FINAL_72 Phase 1 - read-only repo audit: inventory, entry points, dependencies, tests, recovered/duplicate files, broken components, recommended repair order"
+  },
+  "final72-read-server": {
+    "issuer": "soba",
+    "target_edge": "claude-code-local-01",
+    "mission_id": "0f6fffce-4e3d-4179-befb-d442709b580d",
+    "action": "read_file",
+    "params": {
+      "path": "local/server.py"
+    },
+    "approval_state": "APPROVED",
+    "nonce": "final72-read-server"
   }
 }
