@@ -141,8 +141,11 @@ def inject_work(cmd: dict, seen: set) -> tuple[bool, str]:
     nonce     = cmd.get("nonce","")
     dedup_key = f"{work_id}:{nonce}"
 
-    if dedup_key in seen:
-        return False, f"duplicate work_id/nonce: {dedup_key}"
+    # Dedup by nonce alone — work_id changes each run for prose triggers
+    nonce_key = f"nonce:{nonce}"
+    if nonce_key in seen or dedup_key in seen:
+        return False, f"duplicate nonce: {nonce}"
+    seen.add(nonce_key)
 
     mission_id = cmd.get("mission_id")
     if not mission_id:
@@ -185,10 +188,10 @@ def poll_gmail(cursor, seen):
             cursor["last_uid"] = 0
         _, uid_data = M.uid("SEARCH", None, "SINCE", "01-Sep-2026")
         all_uids = uid_data[0].split() if uid_data[0] else []
-        new_uids = [u for u in all_uids if int(u) > cursor["last_uid"]]
+        new_uids = [u for u in all_uids if int(u if isinstance(u, int) else u.decode()) > cursor["last_uid"]]
         for uid_b in new_uids:
-            uid_int = int(uid_b)
-            _, data = M.uid("FETCH", uid_b, "(RFC822)")
+            uid_int = int(uid_b if isinstance(uid_b, int) else uid_b.decode())
+            _, data = M.uid("FETCH", uid_b if isinstance(uid_b, bytes) else str(uid_b).encode(), "(RFC822)")
             if not data or not data[0]: continue
             raw  = email.message_from_bytes(data[0][1])
             body = ""
@@ -209,6 +212,8 @@ def poll_gmail(cursor, seen):
                     print(f"[nb] rejected command: {reason}")
             cursor["last_uid"] = max(cursor["last_uid"], uid_int)
         M.logout()
+    except imaplib.IMAP4.abort as e:
+        print(f"[nb] imap connection reset: {e} — will retry next poll")
     except Exception as e:
         print(f"[nb] gmail error: {e}")
     return cursor
