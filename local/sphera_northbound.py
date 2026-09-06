@@ -264,6 +264,82 @@ def poll_gmail(cursor, seen):
         print(f"[nb] gmail error: {e}")
     return cursor
 
+# Drive outbox file IDs to watch — keyed by edge_id
+DRIVE_OUTBOXES = {
+    "anish-apps-script-edge-01": os.environ.get("ANISH_OUTBOX_FILE_ID", "")
+}
+
+def poll_drive_outboxes(cursor, seen):
+    """
+    Poll Google Drive outbox files for ANISH_APPS_SCRIPT_EDGE results.
+    Injects new work results into SPHERA room.
+    Requires GOOGLE_DRIVE_TOKEN or service account — skips if not configured.
+    """
+    token = os.environ.get("GOOGLE_DRIVE_TOKEN", "")
+    if not token:
+        return cursor  # Not configured yet
+
+    for edge_id, file_id in DRIVE_OUTBOXES.items():
+        if not file_id:
+            continue
+        try:
+            # Check if file has been modified since last poll
+            import urllib.request as _ur
+            meta_req = _ur.Request(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=modifiedTime",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            meta = json.loads(_ur.urlopen(meta_req, timeout=5).read())
+            modified = meta.get("modifiedTime", "")
+            last_seen = cursor.get(file_id, "")
+
+            if modified == last_seen:
+                continue  # No change
+
+            # Read file content
+            content_req = _ur.Request(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/plain",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            content = _ur.urlopen(content_req, timeout=5).read().decode("utf-8", "ignore")
+
+            # Parse work_item_id blocks from outbox
+            import re
+            blocks = re.findall(
+                r'\[ANISH_APPS_SCRIPT_EDGE.*?\](.*?)(?=\[ANISH_APPS_SCRIPT_EDGE|$)',
+                content, re.DOTALL
+            )
+            for block in blocks:
+                # Extract work_item_id from block
+                wid_match = re.search(r'work_item_id:\s*([\w-]+)', block)
+                work_item_id = wid_match.group(1) if wid_match else None
+                nonce_key = f"drive:{file_id}:{work_item_id or hash(block[:50])}"
+                if nonce_key in seen:
+                    continue
+                # Inject into room
+                result_text = block.strip()[:2000]
+                r = room("POST", "/bridge/ingest", {
+                    "principal":         "claude",
+                    "content":           result_text,
+                    "source_message_id": nonce_key,
+                    "transport":         "google-drive",
+                    "provenance": {
+                        "edge_id":           edge_id,
+                        "delegated_for":     "anish",
+                        "continuity_class":  "scheduled_context_reconstruction"
+                    }
+                }, key=BRIDGE_KEY)
+                if r.get("seq") or r.get("duplicate"):
+                    print(f"[nb] Drive outbox ingested: {edge_id} work_item={work_item_id}")
+                    seen.add(nonce_key)
+
+            cursor[file_id] = modified
+
+        except Exception as e:
+            print(f"[nb] drive poll error for {edge_id}: {e}")
+
+    return cursor
+
 def run():
     print("[nb] SPHERA Northbound Ingress v1.0")
     print(f"[nb] room: {SPHERA_URL} | poll: {POLL_SECS}s")
@@ -278,11 +354,19 @@ def run():
     cursor = load_cursor()
     seen   = load_seen()
 
+    # Drive outbox polling state
+    drive_cursor = {}  # file_id -> last_modified_time seen
+
     while True:
         try:
+            # Poll Gmail for SPHERA-NORTHBOUND commands
             cursor = poll_gmail(cursor, seen)
             save_cursor(cursor)
             save_seen(seen)
+
+            # Poll Drive outboxes for ANISH_APPS_SCRIPT_EDGE results
+            drive_cursor = poll_drive_outboxes(drive_cursor, seen)
+
         except KeyboardInterrupt:
             print("\n[nb] stopped.")
             break
