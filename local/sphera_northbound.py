@@ -79,28 +79,64 @@ def save_triggers(triggers):
     with open(tmp,"w") as f: json.dump(triggers, f, indent=2)
     os.replace(tmp, TRIGGER_REGISTRY_FILE)
 
+# Generic action whitelist — no pre-registration needed
+GENERIC_ACTIONS = {
+    "list_dir":    {"required_args": 1, "param_key": "path"},
+    "read_file":   {"required_args": 1, "param_key": "path"},
+    "nonce_probe": {"required_args": 1, "param_key": "nonce_value"},
+    "run_script":  {"required_args": 1, "param_key": "script_name"},
+}
+
 def parse_northbound(body: str) -> dict | None:
     """
-    Parse SPHERA-NORTHBOUND envelope OR simple prose trigger.
-    Prose format: 'SPHERA RUN <trigger_key>' anywhere in email body.
-    Trigger key is looked up in nb_triggers.json (pre-registered by Boss or Claude).
-    This allows Soba to send ordinary prose — no JSON envelope needed.
+    Parse SPHERA-NORTHBOUND envelope OR generic SPHERA RUN command.
+    
+    Generic format (no pre-registration needed):
+      SPHERA RUN list_dir local
+      SPHERA RUN read_file local/server.py
+      SPHERA RUN nonce_probe MYTOKEN
+      SPHERA RUN run_script test_pea.py
+    
+    Falls back to trigger registry for named keys.
+    Falls back to structured envelope.
     """
-    # Try prose trigger first: "SPHERA RUN <key>"
-    import re
-    match = re.search(r'SPHERA RUN ([A-Za-z0-9_-]+)', body)
+    import re, secrets
+    
+    # Try generic SPHERA RUN [action] [arg]
+    match = re.search(r'SPHERA RUN ([A-Za-z0-9_-]+)(?:\s+([^\n]+))?', body)
     if match:
-        trigger_key = match.group(1)
+        token = match.group(1)
+        arg   = (match.group(2) or "").strip()
+        
+        # Check if it's a generic action
+        if token in GENERIC_ACTIONS:
+            spec = GENERIC_ACTIONS[token]
+            params = {spec["param_key"]: arg} if arg else {}
+            nonce  = secrets.token_hex(8)
+            print(f"[nb] generic action: {token} arg={arg!r}")
+            return {
+                "issuer":         "soba",  # default issuer for generic commands
+                "target_edge":    "claude-code-local-01",
+                "mission_id":     None,    # will auto-resolve below
+                "action":         token,
+                "params":         params,
+                "approval_state": "APPROVED",
+                "nonce":          nonce,
+                "capability":     "python_execution",
+                "_generic":       True
+            }
+        
+        # Try named trigger registry
         triggers = load_triggers()
-        if trigger_key in triggers:
-            t = triggers[trigger_key]
-            print(f"[nb] prose trigger matched: {trigger_key}")
+        if token in triggers:
+            t = triggers[token]
+            print(f"[nb] named trigger matched: {token}")
             return t
-        else:
-            print(f"[nb] prose trigger {trigger_key!r} not found in registry")
-            return None
+        
+        print(f"[nb] unknown token {token!r} — not in generic actions or trigger registry")
+        return None
 
-    # Try structured envelope
+    # Try structured SPHERA-NORTHBOUND envelope
     if "SPHERA-NORTHBOUND" not in body: return None
     try:
         s = body.index("SPHERA-NORTHBOUND") + len("SPHERA-NORTHBOUND")
@@ -149,7 +185,17 @@ def inject_work(cmd: dict, seen: set) -> tuple[bool, str]:
 
     mission_id = cmd.get("mission_id")
     if not mission_id:
-        return False, "mission_id required — register trigger with mission_id via nb_triggers.json"
+        if cmd.get("_generic"):
+            # Auto-create a short-lived mission for generic actions
+            r = room("POST", "/mission",
+                     {"objective": f"Generic {cmd.get('action')} by {cmd.get('issuer','unknown')}"},
+                     key=ARCIDES_KEY)
+            mission_id = r.get("mission_id")
+            if not mission_id:
+                return False, f"failed to auto-create mission: {r}"
+            print(f"[nb] auto-created mission {mission_id[:8]} for generic action")
+        else:
+            return False, "mission_id required — register trigger with mission_id via nb_triggers.json"
 
     # Create work item with typed action (serialised as JSON description)
     import json as _json
