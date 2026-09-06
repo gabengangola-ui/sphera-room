@@ -27,7 +27,7 @@ CURSOR_FILE  = "nb_cursor.json"
 SEEN_FILE    = "nb_seen.json"
 
 # Authorised issuers — only these can submit northbound commands
-AUTHORISED_ISSUERS = {"soba", "claude"}
+AUTHORISED_ISSUERS = {"soba", "claude", "coda"}
 # Allowed target edges
 ALLOWED_EDGES = {"claude-code-local-01"}
 
