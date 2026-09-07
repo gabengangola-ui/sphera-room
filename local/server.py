@@ -218,8 +218,7 @@ async def lifespan(app: FastAPI):
         _coda_seen    = set()
 
         def _is_coda_msg(c):
-            c = str(c).lower()
-            return "coda" in c and any(k in c for k in ["reply","respond","tell","write","say","post","process","run","please"])
+            return "coda" in str(c).lower()
 
         def _coda_loop():
             import json as _cj
@@ -240,9 +239,11 @@ async def lifespan(app: FastAPI):
                         try:
                             p = row["payload_json"]
                             if isinstance(p, str): p = _cj.loads(p)
-                            c = p.get("content","")
-                            if isinstance(c, dict): c = c.get("content", str(c))
-                        except: continue
+                            c = p.get("content","") or p.get("text","") or str(p)
+                            if isinstance(c, dict): c = str(c)
+                        except Exception as _pe: 
+                            print(f"[coda-handler] parse err: {_pe}")
+                            continue
                         if not _is_coda_msg(c): continue
                         if not _CODA_KEY: continue
                         prompt = f"[SPHERA room message from {row['principal']} at seq:{row['seq']}]\n\n{c}\n\nYou are Coda in the SPHERA room. Process this and reply in the room."
