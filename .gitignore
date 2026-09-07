@@ -1,0 +1,8 @@
+*.db
+*.log
+test_output/
+.env
+BRIDGE_SECRET
+nb_seen.json
+nb_cursor.json
+bridge_cursor.json
