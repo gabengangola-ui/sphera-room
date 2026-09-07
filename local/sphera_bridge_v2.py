@@ -206,21 +206,40 @@ def _nonce_probe(params, session_id):
     fhash = hashlib.sha256(content.encode()).hexdigest()
     return {"status": "done", "file": fname, "hash": fhash, "content": content}
 
+def _sanitize_path(path: str):
+    """Validate path is safe: relative, no traversal, no shell metacharacters, stays in TEST_DIR."""
+    import re
+    if not path:
+        return None, "empty path"
+    if os.path.isabs(path):
+        return None, "absolute paths not allowed"
+    # Block shell metacharacters
+    if re.search(r"[;&|`$<>\\!]", path):
+        return None, "shell metacharacters not allowed"
+    # Resolve and confirm within TEST_DIR
+    full = os.path.realpath(os.path.join(TEST_DIR, path))
+    test_dir_real = os.path.realpath(TEST_DIR)
+    if not full.startswith(test_dir_real + os.sep) and full != test_dir_real:
+        return None, f"path escapes test directory: {full}"
+    return full, None
+
 def _write_file(params, session_id):
     path    = params.get("path", "")
     content = params.get("content", "")
-    if not path or os.path.isabs(path):
-        return {"status": "failed", "error": "relative paths only"}
-    full = os.path.join(TEST_DIR, path)
+    full, err = _sanitize_path(path)
+    if err:
+        return {"status": "failed", "error": err}
     os.makedirs(os.path.dirname(full), exist_ok=True)
     open(full, "w").write(content)
     return {"status": "done", "file": full, "hash": hashlib.sha256(content.encode()).hexdigest()}
 
 def _read_file(params, session_id):
-    path = os.path.join(TEST_DIR, params.get("path", ""))
-    if not os.path.exists(path):
+    full, err = _sanitize_path(params.get("path", ""))
+    if err:
+        return {"status": "failed", "error": err}
+    if not os.path.exists(full):
         return {"status": "failed", "error": "not found"}
-    content = open(path).read()[:4000]
+    content = open(full).read()[:4000]
     return {"status": "done", "content": content}
 
 def _list_dir(params, session_id):
