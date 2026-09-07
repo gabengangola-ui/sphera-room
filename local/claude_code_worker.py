@@ -159,6 +159,46 @@ def register_edge():
         "continuity_class": "subordinate_worker"
     }, key=os.environ.get("ARCIDES_KEY","ak-sphera"))
 
+CHECKPOINT_TIMEOUT = int(os.environ.get("CHECKPOINT_TIMEOUT", "3600"))  # 1hr default
+
+def emit_checkpoint(work_id, question, options=None, recommendation=None):
+    """Emit a checkpoint event to the room so Soba can answer without Boss."""
+    return room("POST", "/bridge/ingest", {
+        "principal":         "claude",
+        "content":           json.dumps({
+            "event_type":    "work_checkpoint",
+            "work_id":       work_id,
+            "question":      question,
+            "options":       options or [],
+            "recommendation": recommendation,
+            "edge_id":       EDGE_ID,
+            "awaiting_reply": True
+        }),
+        "source_message_id": f"checkpoint-{work_id}-{uuid.uuid4()}",
+        "transport":         "claude-code-checkpoint",
+        "provenance": {"edge_id": EDGE_ID, "continuity_class": "subordinate_worker"}
+    })
+
+def poll_checkpoint_reply(work_id, emitted_at):
+    """Poll room for a reply to a checkpoint. Returns reply text or None if timeout."""
+    import time as _time
+    deadline = emitted_at + CHECKPOINT_TIMEOUT
+    print(f"[ccw] waiting for checkpoint reply on work_id={work_id[:8]}...")
+    while _time.time() < deadline:
+        r = room("GET", f"/events?after=0")
+        for ev in reversed(r.get("events", [])):
+            payload = ev.get("payload_json", {})
+            if isinstance(payload, str):
+                try: payload = json.loads(payload)
+                except: continue
+            if (payload.get("event_type") == "checkpoint_reply" and
+                payload.get("work_id") == work_id):
+                reply = payload.get("reply", "")
+                print(f"[ccw] checkpoint reply received: {reply[:60]}")
+                return reply
+        _time.sleep(15)
+    return None  # Timeout
+
 def try_claim_and_execute(work_id, description):
     """Try to claim and execute a single work item."""
     claim = room("POST", f"/work/{work_id}/claim", {"lease_seconds": LEASE_SECS})
@@ -168,7 +208,26 @@ def try_claim_and_execute(work_id, description):
 
     instruction = description
     print(f"[ccw] executing: {work_id[:8]} | {instruction[:60]}")
+
+    # Check if instruction is interactive (may produce checkpoints)
     result = execute_instruction(instruction, work_id)
+
+    # If result contains a checkpoint question, emit and wait for reply
+    if result.get("status") == "checkpoint":
+        question = result.get("question", "Checkpoint reached — how to proceed?")
+        options  = result.get("options", [])
+        rec      = result.get("recommendation")
+        emit_checkpoint(work_id, question, options, rec)
+        post_message(f"[claude-code-local-01] Work {work_id[:8]} reached checkpoint. Soba: please reply with guidance.")
+        import time as _time
+        reply = poll_checkpoint_reply(work_id, _time.time())
+        if reply:
+            # Re-execute with the reply as continuation
+            continuation = f"{instruction}\n\nCheckpoint answer: {reply}"
+            result = execute_instruction(continuation, work_id)
+        else:
+            result = {"status": "failed", "error": "checkpoint timeout — no reply received", "edge_id": EDGE_ID}
+
     room("POST", f"/work/{work_id}/result", {"lease_id": lid, "result": result})
     status = result.get("status","?")
     print(f"[ccw] result: {work_id[:8]} → {status}")
