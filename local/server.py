@@ -208,6 +208,65 @@ async def lifespan(app: FastAPI):
         print("[sphera] orchestrator running")
     except Exception as e:
         print(f"[sphera] orchestrator failed to start: {e}")
+
+    # Coda session handler — routes room messages to live Claude Code session
+    # Built into SPHERA runtime — no extra window or script needed
+    try:
+        import threading as _ct, subprocess as _csp, time as _ctm
+        _CODA_SESSION = _os.environ.get("CODA_SESSION_ID", "cf7239f2-e00a-4878-bdc7-41d0708946d0")
+        _CODA_KEY     = _os.environ.get("ANTHROPIC_API_KEY", "")
+        _coda_seen    = set()
+
+        def _is_coda_msg(c):
+            c = str(c).lower()
+            return "coda" in c and any(k in c for k in ["reply","respond","tell","write","say","post","process","run","please"])
+
+        def _coda_loop():
+            import json as _cj
+            cur = 0
+            while True:
+                try:
+                    with get_db() as _db:
+                        rows = _db.execute(
+                            "SELECT seq,principal,type,payload_json FROM events WHERE workspace_id='default' AND seq>? AND principal NOT IN ('claude','system','arcides') ORDER BY seq LIMIT 20",
+                            (cur,)
+                        ).fetchall()
+                    for row in rows:
+                        cur = max(cur, row["seq"])
+                        if row["seq"] in _coda_seen: continue
+                        _coda_seen.add(row["seq"])
+                        if len(_coda_seen) > 2000: _coda_seen.clear()
+                        if row["type"] != "message": continue
+                        try:
+                            p = row["payload_json"]
+                            if isinstance(p, str): p = _cj.loads(p)
+                            c = p.get("content","")
+                            if isinstance(c, dict): c = c.get("content", str(c))
+                        except: continue
+                        if not _is_coda_msg(c): continue
+                        if not _CODA_KEY: continue
+                        prompt = f"[SPHERA room message from {row['principal']} at seq:{row['seq']}]\n\n{c}\n\nYou are Coda in the SPHERA room. Process this and reply in the room."
+                        try:
+                            res = _csp.run(["claude","--resume",_CODA_SESSION,"--print",prompt],
+                                capture_output=True, text=True, timeout=120,
+                                env={**_os.environ, "ANTHROPIC_API_KEY": _CODA_KEY})
+                            out = res.stdout.strip()
+                            if out:
+                                with get_db() as _db:
+                                    emit(_db, "claude", "message", {"content": f"[coda] {out}", "seq_ref": row["seq"]})
+                                    _db.commit()
+                                print(f"[coda-handler] replied at seq:{row['seq']}")
+                        except Exception as _ce:
+                            print(f"[coda-handler] error: {_ce}")
+                except Exception as _e:
+                    print(f"[coda-handler] loop error: {_e}")
+                _ctm.sleep(5)
+
+        _ct.Thread(target=_coda_loop, daemon=True, name="coda-handler").start()
+        print(f"[sphera] Coda handler running session={_CODA_SESSION[:8]}...")
+    except Exception as e:
+        print(f"[sphera] Coda handler failed: {e}")
+
     yield
 
 app = FastAPI(title="SPHERA", version="2.0", lifespan=lifespan)
