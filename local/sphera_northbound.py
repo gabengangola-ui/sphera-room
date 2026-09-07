@@ -136,6 +136,24 @@ def parse_northbound(body: str) -> dict | None:
         print(f"[nb] unknown token {token!r} — not in generic actions or trigger registry")
         return None
 
+    # Try SPHERA REPLY [work_id]: [answer] — Soba answers a checkpoint
+    reply_match = re.search(r'SPHERA REPLY ([A-Za-z0-9_-]+):\s*(.+)', body, re.DOTALL)
+    if reply_match:
+        work_id = reply_match.group(1).strip()
+        reply   = reply_match.group(2).strip()[:2000]
+        import secrets as _sec
+        print(f"[nb] checkpoint reply: work_id={work_id[:8]} reply={reply[:40]}")
+        return {
+            "issuer":         "soba",
+            "target_edge":    "claude-code-local-01",
+            "mission_id":     None,
+            "action":         "checkpoint_reply",
+            "params":         {"work_id": work_id, "reply": reply},
+            "approval_state": "APPROVED",
+            "nonce":          _sec.token_hex(8),
+            "_checkpoint_reply": True
+        }
+
     # Try structured SPHERA-NORTHBOUND envelope
     if "SPHERA-NORTHBOUND" not in body: return None
     try:
